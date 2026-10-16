@@ -805,6 +805,35 @@ typedef void (^SelfTestStep)(void (^next)(void));
     return j ? wvp::ParseDebugInfo(*j) : wvp::DebugInfo{};
 }
 
+/// Seeks to `seconds` while playing, pauses once a picture of that seek is on screen and playback reached `seconds`,
+/// then waits for Paused; `next` gets whether the paused picture is from the seek. A pause that lands between the seek
+/// and its first picture keeps the pre-seek picture on screen, and the display thread still drops the queued pictures
+/// of the old serial while paused, so the next paused redraw (a subtitle style change, for one) shows the last dropped
+/// picture: the paused video pixels change. The engine's frame trace tells the cases apart. The serial before the seek
+/// is read once a picture is on screen and nothing newer is decoded: right after an open neither is reported yet, and
+/// the open's first pictures would then pass for the seek's. A picture of the seek is on screen once the presented
+/// serial is newer than that and equal to the decoded serial.
+- (void)seek:(double)seconds thenPause:(void (^)(bool landed))next {
+    wvp::FfPlayer* player = _mv->Player();
+    auto shown = ^std::int64_t {   // the serial of the picture on screen when nothing newer is decoded, else -1
+        const wvp::DebugFrameTrace t = [self debugInfo].FrameTrace;
+        return t.Presented.Serial && t.Decoded.Serial && *t.Presented.Serial == *t.Decoded.Serial ? *t.Presented.Serial : -1;
+    };
+    [self waitFor:^bool { return player->State() == wvp::PlayerState::Playing && shown() >= 0; } seconds:10 then:^{
+        const std::int64_t serial = shown();
+        player->Seek(seconds);
+        [self waitFor:^bool { return player->State() == wvp::PlayerState::Playing && shown() > serial && player->Position() >= seconds; }
+               seconds:10 then:^{
+            player->Pause();
+            [self waitFor:^bool { return player->State() == wvp::PlayerState::Paused; } seconds:5 then:^{
+                const std::int64_t now = shown();
+                printf("     seek to %.1f s: shown serial %lld -> %lld, paused at %.3f s\n", seconds, (long long)serial, (long long)now, player->Position());
+                next(player->State() == wvp::PlayerState::Paused && serial >= 0 && now > serial);
+            }];
+        }];
+    }];
+}
+
 // One sample of the engine's sync state: A-V (audio clock - video clock, ms; NaN when the clip is not playing with the
 // audio master), both clocks (s), the sampling time (s) and the late frame drops so far.
 struct AvSample { double avMs, audio, video, at; long long dropsLate; };
@@ -1044,37 +1073,34 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
     }];
     [steps addObject:^(void (^next)(void)) {
         if (auto mi = player->GetMediaInfo()) for (const auto& st : mi->Streams) if (st.path == korean) player->SelectStream(wvp::StreamType::Subtitle, st.Index);
-        player->Seek(4.5);
-        [self after:0.5 run:^{
-            player->Pause();
-            [self after:0.3 run:^{
-                const long long before = drawn();
-                const long long presented = JsonInt(mv->Eng().PresenterStats(), "frames_presented");
-                auto button = mv->shell->Bar()->ButtonWidget(app::B_Subs)->Bounds();
-                [self click:{button.cx(), button.cy()}];
-                check(!mv->SubsButtonLit() && !mv->Svc().settings.showCaptions, "bar subtitle button hides text subtitles and unlights");
-                [self after:0.4 run:^{
-                    const long long after = JsonInt(mv->Eng().PresenterStats(), "frames_presented");
-                    char what[200];
-                    snprintf(what, sizeof what, "paused subtitle hide redraws without overlays (frames_presented %lld -> %lld; rects_drawn %lld -> %lld)",
-                             presented, after, before, drawn());
-                    check(player->State() == wvp::PlayerState::Paused && after > presented && drawn() == before, what);
-                    auto b = mv->shell->Bar()->ButtonWidget(app::B_Subs)->Bounds();
-                    [self click:{b.cx(), b.cy()}];
-                    [self waitFor:^bool { return drawn() > before; } seconds:3 then:^{
-                        check(drawn() > before && mv->SubsButtonLit(), "bar subtitle button shows text subtitles again (presenter rects resume; lit)");
-                        [self key:43 chars:@","];
-                        check(player->SubtitleDelay() == -500 && mv->LastToast().find(L"-0.5") != std::wstring::npos,
-                              "comma sets engine subtitle delay -0.5 s with sync toast");
-                        [self key:47 chars:@"."];
-                        [self key:47 chars:@"."];
-                        check(player->SubtitleDelay() == 500 && mv->LastToast().find(L"+0.5") != std::wstring::npos,
-                              "period sets engine subtitle delay +0.5 s with sync toast");
-                        [self key:44 chars:@"/"];
-                        check(player->SubtitleDelay() == 0 && mv->LastToast().find(L"+0.0") != std::wstring::npos,
-                              "slash resets engine subtitle delay with sync toast");
-                        next();
-                    }];
+        [self seek:4.5 thenPause:^(bool landed) {
+            check(landed, "the 4.5 s seek shows its picture before the pause (bar subtitle button checks)");
+            const long long before = drawn();
+            const long long presented = JsonInt(mv->Eng().PresenterStats(), "frames_presented");
+            auto button = mv->shell->Bar()->ButtonWidget(app::B_Subs)->Bounds();
+            [self click:{button.cx(), button.cy()}];
+            check(!mv->SubsButtonLit() && !mv->Svc().settings.showCaptions, "bar subtitle button hides text subtitles and unlights");
+            [self after:0.4 run:^{
+                const long long after = JsonInt(mv->Eng().PresenterStats(), "frames_presented");
+                char what[200];
+                snprintf(what, sizeof what, "paused subtitle hide redraws without overlays (frames_presented %lld -> %lld; rects_drawn %lld -> %lld)",
+                         presented, after, before, drawn());
+                check(player->State() == wvp::PlayerState::Paused && after > presented && drawn() == before, what);
+                auto b = mv->shell->Bar()->ButtonWidget(app::B_Subs)->Bounds();
+                [self click:{b.cx(), b.cy()}];
+                [self waitFor:^bool { return drawn() > before; } seconds:3 then:^{
+                    check(drawn() > before && mv->SubsButtonLit(), "bar subtitle button shows text subtitles again (presenter rects resume; lit)");
+                    [self key:43 chars:@","];
+                    check(player->SubtitleDelay() == -500 && mv->LastToast().find(L"-0.5") != std::wstring::npos,
+                          "comma sets engine subtitle delay -0.5 s with sync toast");
+                    [self key:47 chars:@"."];
+                    [self key:47 chars:@"."];
+                    check(player->SubtitleDelay() == 500 && mv->LastToast().find(L"+0.5") != std::wstring::npos,
+                          "period sets engine subtitle delay +0.5 s with sync toast");
+                    [self key:44 chars:@"/"];
+                    check(player->SubtitleDelay() == 0 && mv->LastToast().find(L"+0.0") != std::wstring::npos,
+                          "slash resets engine subtitle delay with sync toast");
+                    next();
                 }];
             }];
         }];
@@ -1130,91 +1156,92 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
     }];
     [steps addObject:^(void (^next)(void)) {
         if (auto mi = player->GetMediaInfo()) for (const auto& st : mi->Streams) if (st.path == korean) player->SelectStream(wvp::StreamType::Subtitle, st.Index);
-        player->Seek(4.5);
-        [self after:0.5 run:^{
-            player->Pause();
-            [self after:0.3 run:^{
-                const auto before = player->Snapshot(true);
-                const auto plain = player->Snapshot(false);
-                check(before && plain && before->Data != plain->Data, "snapshot includes the rendered Korean subtitle, unlike the plain video snapshot");
-                [self openSettings];
-                pui::Widget* page = self->_settings->Page();
-                auto* source = dynamic_cast<pui::ToggleSwitch*>(FindById(page, L"SubtitleUseWindowsToggle"));
-                if (source) source->SetOn(false);
-                auto* fontButton = FindById(page, L"SubtitleFontButton");
-                check(source && fontButton && fontButton->IsEffectivelyVisible(), "app subtitle style source shows the font editor button");
-                if (fontButton) fontButton->Invoke();
-                auto* dialog = self->_settings->Ui().TopPopup();
-                auto* fonts = dynamic_cast<pui::ComboBox*>(FindById(dialog, L"SubtitleFontFamilyCombo"));
-                bool macFont = false;
-                if (fonts) {
-                    const int original = fonts->SelectedIndex();
-                    for (int i = 0; i < fonts->ItemCount(); i++) {
-                        fonts->SetSelectedIndex(i);
-                        const auto text = fonts->SelectedText();
-                        macFont = macFont || text == L"Apple SD Gothic Neo" || text == L"Helvetica";
-                    }
-                    fonts->SetSelectedIndex(original);
+        [self seek:4.5 thenPause:^(bool landed) {
+            check(landed, "the 4.5 s seek shows its picture before the pause (Settings subtitle style checks)");
+            const auto before = player->Snapshot(true);
+            const auto plain = player->Snapshot(false);
+            check(before && plain && before->Data != plain->Data, "snapshot includes the rendered Korean subtitle, unlike the plain video snapshot");
+            [self openSettings];
+            pui::Widget* page = self->_settings->Page();
+            auto* source = dynamic_cast<pui::ToggleSwitch*>(FindById(page, L"SubtitleUseWindowsToggle"));
+            if (source) source->SetOn(false);
+            auto* fontButton = FindById(page, L"SubtitleFontButton");
+            check(source && fontButton && fontButton->IsEffectivelyVisible(), "app subtitle style source shows the font editor button");
+            if (fontButton) fontButton->Invoke();
+            auto* dialog = self->_settings->Ui().TopPopup();
+            auto* fonts = dynamic_cast<pui::ComboBox*>(FindById(dialog, L"SubtitleFontFamilyCombo"));
+            bool macFont = false;
+            if (fonts) {
+                const int original = fonts->SelectedIndex();
+                for (int i = 0; i < fonts->ItemCount(); i++) {
+                    fonts->SetSelectedIndex(i);
+                    const auto text = fonts->SelectedText();
+                    macFont = macFont || text == L"Apple SD Gothic Neo" || text == L"Helvetica";
                 }
-                check(fonts && fonts->ItemCount() > 20 && macFont, "pui subtitle font editor enumerates the installed Mac families");
-                auto* size = dynamic_cast<pui::TextBox*>(FindById(dialog, L"SubtitleFontSizeTextBox"));
-                auto* hex = dynamic_cast<pui::TextBox*>(FindById(dialog, L"SubtitleColorHexTextBox"));
-                auto* accept = FindById(dialog, L"SubtitlePickerApplyButton");
-                const auto unchanged = mv->Svc().settings.subtitle;
-                if (size && hex && accept) {
-                    size->SetValue(L"3");
-                    check(!accept->Enabled(), "font editor rejects sizes below 4 pt");
-                    size->SetValue(L"401");
-                    check(!accept->Enabled(), "font editor rejects sizes above 400 pt");
-                    size->SetValue(L"36.5");
-                    hex->SetValue(L"#GG0000");
-                    check(!accept->Enabled(), "font editor rejects invalid RGB text");
-                } else check(false, "font editor exposes size and RGB validation controls");
-                if (auto* cancel = FindById(dialog, L"SubtitlePickerCancelButton")) cancel->Invoke();
-                check(self->_settings->Ui().PopupCount() == 0 && mv->Svc().settings.subtitle == unchanged,
-                      "Cancel closes the font editor without changing subtitle settings");
-                if (fontButton) fontButton->Invoke();
-                self->_settings->Ui().KeyDown(pui::key::Escape, 0);
-                check(self->_settings->Ui().PopupCount() == 0 && mv->Svc().settings.subtitle == unchanged,
-                      "Escape cancels the font editor without changes");
-                if (fontButton) fontButton->Invoke();
-                dialog = self->_settings->Ui().TopPopup();
-                auto* yellow = FindById(dialog, L"SubtitleColorPresetFFFF00");
-                auto* apply = FindById(dialog, L"SubtitlePickerApplyButton");
-                check(yellow && apply, "pui subtitle font editor exposes text colour and Apply");
-                if (yellow) yellow->Invoke();
-                if (apply) apply->Invoke();
-                check(mv->Svc().settings.subtitle.primaryRgba == 0xFFFF00FFu && self->_settings->Ui().PopupCount() == 0,
-                      "Apply saves yellow text and closes the pui editor");
-                auto* fontOverride = dynamic_cast<pui::ToggleSwitch*>(FindById(page, L"SubtitleOverrideFontToggle"));
-                if (fontOverride) fontOverride->SetOn(true);
-                auto* colors = dynamic_cast<pui::ToggleSwitch*>(FindById(page, L"SubtitleOverrideColorsToggle"));
-                if (colors) colors->SetOn(true);
-                [self after:0.5 run:^{
-                    const auto after = player->Snapshot(true);
-                    const auto plainAfter = player->Snapshot(false);
-                    check(before && after && plain && plainAfter && before->Data != after->Data && plain->Data == plainAfter->Data,
-                          "Settings subtitle style applies live: subtitle snapshot changes while paused video pixels stay identical");
-                    if (source) source->SetOn(true);
-                    [self after:0.4 run:^{
-                        const auto systemBefore = player->Snapshot(true);
-                        const int refreshes = mainview::LastCaptionRefresh().count;
-                        auto appearance = mainview::ReadCaptionAppearance();
-                        appearance.textRgba = 0x00FF00FFu;
-                        appearance.fontScale = 1.5;
-                        mainview::SetCaptionAppearanceOverride(appearance);
+                fonts->SetSelectedIndex(original);
+            }
+            check(fonts && fonts->ItemCount() > 20 && macFont, "pui subtitle font editor enumerates the installed Mac families");
+            auto* size = dynamic_cast<pui::TextBox*>(FindById(dialog, L"SubtitleFontSizeTextBox"));
+            auto* hex = dynamic_cast<pui::TextBox*>(FindById(dialog, L"SubtitleColorHexTextBox"));
+            auto* accept = FindById(dialog, L"SubtitlePickerApplyButton");
+            const auto unchanged = mv->Svc().settings.subtitle;
+            if (size && hex && accept) {
+                size->SetValue(L"3");
+                check(!accept->Enabled(), "font editor rejects sizes below 4 pt");
+                size->SetValue(L"401");
+                check(!accept->Enabled(), "font editor rejects sizes above 400 pt");
+                size->SetValue(L"36.5");
+                hex->SetValue(L"#GG0000");
+                check(!accept->Enabled(), "font editor rejects invalid RGB text");
+            } else check(false, "font editor exposes size and RGB validation controls");
+            if (auto* cancel = FindById(dialog, L"SubtitlePickerCancelButton")) cancel->Invoke();
+            check(self->_settings->Ui().PopupCount() == 0 && mv->Svc().settings.subtitle == unchanged,
+                  "Cancel closes the font editor without changing subtitle settings");
+            if (fontButton) fontButton->Invoke();
+            self->_settings->Ui().KeyDown(pui::key::Escape, 0);
+            check(self->_settings->Ui().PopupCount() == 0 && mv->Svc().settings.subtitle == unchanged,
+                  "Escape cancels the font editor without changes");
+            if (fontButton) fontButton->Invoke();
+            dialog = self->_settings->Ui().TopPopup();
+            auto* yellow = FindById(dialog, L"SubtitleColorPresetFFFF00");
+            auto* apply = FindById(dialog, L"SubtitlePickerApplyButton");
+            check(yellow && apply, "pui subtitle font editor exposes text colour and Apply");
+            if (yellow) yellow->Invoke();
+            if (apply) apply->Invoke();
+            check(mv->Svc().settings.subtitle.primaryRgba == 0xFFFF00FFu && self->_settings->Ui().PopupCount() == 0,
+                  "Apply saves yellow text and closes the pui editor");
+            auto* fontOverride = dynamic_cast<pui::ToggleSwitch*>(FindById(page, L"SubtitleOverrideFontToggle"));
+            if (fontOverride) fontOverride->SetOn(true);
+            auto* colors = dynamic_cast<pui::ToggleSwitch*>(FindById(page, L"SubtitleOverrideColorsToggle"));
+            if (colors) colors->SetOn(true);
+            [self after:0.5 run:^{
+                const auto after = player->Snapshot(true);
+                const auto plainAfter = player->Snapshot(false);
+                const bool restyled = before && after && before->Data != after->Data;
+                const bool sameVideo = plain && plainAfter && plain->Data == plainAfter->Data;
+                char what[200];
+                snprintf(what, sizeof what, "Settings subtitle style applies live: subtitle snapshot changes while paused video pixels stay identical"
+                         " (subtitles changed %d, video identical %d)", restyled, sameVideo);
+                check(restyled && sameVideo, what);
+                if (source) source->SetOn(true);
+                [self after:0.4 run:^{
+                    const auto systemBefore = player->Snapshot(true);
+                    const int refreshes = mainview::LastCaptionRefresh().count;
+                    auto appearance = mainview::ReadCaptionAppearance();
+                    appearance.textRgba = 0x00FF00FFu;
+                    appearance.fontScale = 1.5;
+                    mainview::SetCaptionAppearanceOverride(appearance);
+                    mainview::PostCaptionAppearanceChanged();
+                    [self after:0.7 run:^{
+                        const auto systemAfter = player->Snapshot(true);
+                        check(systemBefore && systemAfter && systemBefore->Data != systemAfter->Data &&
+                              mainview::LastCaptionRefresh().count == refreshes && player->State() == wvp::PlayerState::Paused,
+                              "system text colour/size changes redraw paused subtitles without an ARIB decoder refresh");
+                        mainview::SetCaptionAppearanceOverride(std::nullopt);
                         mainview::PostCaptionAppearanceChanged();
-                        [self after:0.7 run:^{
-                            const auto systemAfter = player->Snapshot(true);
-                            check(systemBefore && systemAfter && systemBefore->Data != systemAfter->Data &&
-                                  mainview::LastCaptionRefresh().count == refreshes && player->State() == wvp::PlayerState::Paused,
-                                  "system text colour/size changes redraw paused subtitles without an ARIB decoder refresh");
-                            mainview::SetCaptionAppearanceOverride(std::nullopt);
-                            mainview::PostCaptionAppearanceChanged();
-                            self->_settings->Close();
-                            player->Play();
-                            next();
-                        }];
+                        self->_settings->Close();
+                        player->Play();
+                        next();
                     }];
                 }];
             }];
