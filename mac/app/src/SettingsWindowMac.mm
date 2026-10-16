@@ -12,6 +12,7 @@
 #include "Localize.h"
 #include "LoggingMac.h"
 #include "MainView.h"
+#include "PopupDismissMac.h"
 #include "PuiHostView.h"
 #include "features/SettingsLogic.h"
 #include "features/SettingsService.h"
@@ -488,10 +489,16 @@ SettingsWindow::SettingsWindow(MainView& mv) : impl_(std::make_unique<Impl>(mv))
     [d.view setThemeMaker:[m](float scale) { return m->MakeTheme(scale); }];
     pui::UiHost* host = &d.host;
     [d.view setOnResize:[host](NSSize s) { host->SetSize({(float)s.width, (float)s.height}); }];
+    // Deactivation / miniaturise / close close the flyouts; the caption style editors stand in for the font and colour
+    // dialogs Windows owns by this window and stay (their own flyouts close).
+    PuiHostView* view = d.view;
+    popupdismiss::Watch(d.host, (__bridge void*)d.window, [](const pui::Widget* w) { return dynamic_cast<const SubtitleStyleDialog*>(w) != nullptr; },
+                        [view] { [view afterEvent]; });
 }
 
 SettingsWindow::~SettingsWindow() {
     Impl& d = *impl_;
+    popupdismiss::Unwatch(d.host);
     d.host.onInvalidate = nullptr;
     d.delegate.owner = nullptr;
     [d.window orderOut:nil];

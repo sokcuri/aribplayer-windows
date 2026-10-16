@@ -44,6 +44,8 @@
 #include "Localize.h"
 #include "LoggingMac.h"
 #include "MainView.h"
+#include "MenuWindowsMac.h"
+#include "PopupDismissMac.h"
 #include "Engine.h"
 #include "NativeMenuMac.h"
 #include "OpenFlowsMac.h"
@@ -52,6 +54,7 @@
 #include "VideoView.h"
 #include "WindowSizing.h"
 #include "features/Logging.h"
+#include "features/FiltersPanel.h"
 #include "features/MiniLogic.h"
 #include "features/OpenFlows.h"
 #include "features/OpenLogic.h"
@@ -490,6 +493,8 @@ static NSEventModifierFlags MacMods(unsigned m) {
     _shell = [[ShellView alloc] initWithFrame:fx.bounds mainView:_mv.get() renderer:_renderer.get()];
     _shell.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [fx addSubview:_shell];
+    menuwindows::Attach(_mv->host, (__bridge void*)_shell);   // the shell's menus in their own windows
+    popupdismiss::Watch(_mv->host, (__bridge void*)_window, {}, [weakSelf] { AppDelegate* s = weakSelf; if (s) [s->_shell afterEvent]; });   // App WM_ACTIVATE / SIZE_MINIMIZED
     _themeObserver = std::make_unique<puimac::ThemeObserver>([weakSelf] {
         AppDelegate* s = weakSelf;
         if (!s) return;
@@ -676,6 +681,8 @@ static NSEventModifierFlags MacMods(unsigned m) {
     if (_settings) _settings->Close();
     if (_mv) _mv->Shutdown();   // settings.json (window placement, current playlist), the resume position
     _settings.reset();
+    menuwindows::Detach();
+    if (_mv) popupdismiss::Unwatch(_mv->host);
     _mv.reset();                // controller, then FfPlayer (ffp_destroy) and its presenter
     if (_tempDataDir) {
         std::error_code ec;
@@ -963,6 +970,344 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
             }];
         }];
     }];
+}
+
+/// A mouse event at a host point (shell-view coordinates) for a menu window, in that window's coordinates.
+- (NSEvent*)menuWindowEvent:(NSEventType)type at:(pui::PointF)p window:(NSWindow*)w {
+    const NSPoint screen = [_window convertPointToScreen:[_shell convertPoint:NSMakePoint(p.x, p.y) toView:nil]];
+    return [NSEvent mouseEventWithType:type location:[w convertPointFromScreen:screen] modifierFlags:0
+                             timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:w.windowNumber context:nil eventNumber:0
+                            clickCount:type == NSEventTypeMouseMoved ? 0 : 1 pressure:1];
+}
+
+/// Menus in their own windows (MenuWindowsMac): in the mini player and in a small main window at the screen's
+/// bottom-right corner, the main menu (taller than either window) opens fully inside the screen's visible frame, beyond
+/// the owner window, flipping left / above at the screen edges; submenus open beside it; hover, clicks and keys reach
+/// the menus through their windows; Escape, a press outside, the owner's deactivation / move and a press in another
+/// window close them.
+- (void)runMenuWindowTests:(void (^)(bool, const char*))check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    __block NSRect savedFrame = _window.frame;
+    auto screenFrame = ^NSRect(NSRect r) {
+        NSScreen* screen = self->_window.screen ?: NSScreen.mainScreen;
+        for (NSScreen* s in NSScreen.screens)
+            if (NSPointInRect(NSMakePoint(NSMidX(r), NSMidY(r)), s.frame)) { screen = s; break; }
+        return screen.visibleFrame;
+    };
+    auto toScreen = ^NSPoint(pui::PointF p) { return [self->_window convertPointToScreen:[self->_shell convertPoint:NSMakePoint(p.x, p.y) toView:nil]]; };
+    auto rowCentre = [](puimac::MenuPopup* m, int i) { const pui::RectF r = m->RowRect(i); return pui::PointF{r.cx(), r.cy()}; };
+    auto indexOf = [](puimac::MenuPopup* m, const wchar_t* text) {
+        for (int i = 0; m && i < m->ItemCount(); i++) if (m->Items()[(size_t)i].text == text) return i;
+        return -1;
+    };
+    auto windowOf = [](puimac::MenuPopup* m) { return (__bridge NSPanel*)menuwindows::WindowOf(m); };
+    auto openMenu = ^puimac::MenuPopup*(pui::PointF at) {
+        [self->_shell rightMouseDown:[self mouseEvent:NSEventTypeRightMouseDown at:at clicks:1]];
+        [self->_shell rightMouseUp:[self mouseEvent:NSEventTypeRightMouseUp at:at clicks:1]];
+        return dynamic_cast<puimac::MenuPopup*>(mv->host.TopPopup());
+    };
+    auto closed = ^bool { return mv->host.PopupCount() == 0 && menuwindows::OpenWindows() == 0; };
+    // the menu at `at` fits the visible frame, is taller than the owner and leaves it; flipped: opened left / above
+    auto checkFits = ^(puimac::MenuPopup* root, pui::PointF at, const char* where, bool expectFlip) {
+        NSPanel* w = windowOf(root);
+        const NSRect f = w ? w.frame : NSZeroRect, owner = self->_window.frame, vf = screenFrame(f);
+        const NSPoint click = toScreen(at);
+        char what[480];
+        snprintf(what, sizeof what, "%s: the main menu has its own window (non-activating panel, never key, a child of the player window at "
+                 "level %ld above its level %ld, painted %d times; the host does not paint it)", where, (long)w.level, (long)self->_window.level,
+                 menuwindows::PaintCount(root));
+        check(root && w && w.visible && w.parentWindow == self->_window && (w.styleMask & NSWindowStyleMaskNonactivatingPanel) && !w.canBecomeKeyWindow &&
+              w.level > self->_window.level && menuwindows::PaintCount(root) > 0 && root->OwnWindow(), what);
+        snprintf(what, sizeof what, "%s: taller than the window it opens fully on screen (menu %.0f,%.0f %.0fx%.0f; window %.0f,%.0f %.0fx%.0f; visible frame %.0f,%.0f %.0fx%.0f)",
+                 where, NSMinX(f), NSMinY(f), NSWidth(f), NSHeight(f), NSMinX(owner), NSMinY(owner), NSWidth(owner), NSHeight(owner),
+                 NSMinX(vf), NSMinY(vf), NSWidth(vf), NSHeight(vf));
+        check(w && NSHeight(f) > NSHeight(owner) && NSContainsRect(vf, f) && !NSContainsRect(owner, f), what);
+        const NSRect expect = root ? [self->_window convertRectToScreen:[self->_shell convertRect:NSMakeRect(root->Bounds().l, root->Bounds().t, root->Bounds().w(), root->Bounds().h()) toView:nil]] : NSZeroRect;
+        const bool left = std::fabs(NSMaxX(f) - click.x) < 1, above = std::fabs(NSMinY(f) - click.y) < 1;
+        const bool atPoint = (left || std::fabs(NSMinX(f) - click.x) < 1) && (above || std::fabs(NSMaxY(f) - click.y) < 1);
+        snprintf(what, sizeof what, "%s: the window shows the menu where it is in the host, a corner at the click (%.0f,%.0f)%s",
+                 where, click.x, click.y, expectFlip ? ", opened to the left and above at the screen's bottom-right edge" : "");
+        check(w && NSEqualRects(NSIntegralRect(expect), NSIntegralRect(f)) && atPoint && (!expectFlip || (left && above)), what);
+    };
+    // a submenu opened by hovering its row in the menu window: beside the menu, on screen, in its own window
+    auto checkSub = ^(puimac::MenuPopup* root, int row, const char* where, bool expectLeft, void (^then)(puimac::MenuPopup*)) {
+        NSPanel* w = windowOf(root);
+        if (w) [w.contentView mouseMoved:[self menuWindowEvent:NSEventTypeMouseMoved at:rowCentre(root, row) window:w]];
+        [self after:0.45 run:^{
+            puimac::MenuPopup* sub = root->SubMenu();
+            NSPanel* sw = windowOf(sub);
+            const NSRect f = sw ? sw.frame : NSZeroRect, rf = w.frame, vf = screenFrame(rf);
+            const bool right = NSMinX(f) >= NSMaxX(rf) - 8, left = NSMaxX(f) <= NSMinX(rf) + 8;
+            const NSPoint rowAt = toScreen(rowCentre(root, row));
+            char what[400];
+            snprintf(what, sizeof what, "%s: hovering a submenu row in the menu window opens the submenu in its own window beside the menu (%s), on screen "
+                     "(submenu %.0f,%.0f %.0fx%.0f; menu %.0f,%.0f %.0fx%.0f)", where, right ? "right" : left ? "left" : "overlapping",
+                     NSMinX(f), NSMinY(f), NSWidth(f), NSHeight(f), NSMinX(rf), NSMinY(rf), NSWidth(rf), NSHeight(rf));
+            check(sub && sw && sw.visible && root->SubMenuIndex() == row && NSContainsRect(vf, f) && (expectLeft ? left : right) &&
+                  rowAt.y >= NSMinY(f) && rowAt.y <= NSMaxY(f) && sw.level == w.level && menuwindows::OpenWindows() == 2, what);
+            then(sub);
+        }];
+    };
+
+    NSMutableArray<SelfTestStep>* steps = [NSMutableArray array];
+    // the mini player: open, a submenu, keys, Escape
+    [steps addObject:^(void (^done)(void)) {
+        mv->Execute(app::CommandId::ToggleMiniPlayer);
+        [self after:0.6 run:^{
+            const pui::PointF at{mv->Layout().video.l / mv->Scale() + 40, mv->Layout().video.t / mv->Scale() + 30};
+            const bool wasKey = self->_window.keyWindow;
+            puimac::MenuPopup* root = openMenu(at);
+            const int video = indexOf(root, app::Tr(L"Video", L"영상"));
+            [self after:0.2 run:^{
+                checkFits(root, at, "mini player", false);
+                check(self->_window.keyWindow == wasKey, "mini player: the player window keeps the keyboard (stays key) while the menu shows");
+                if (!root || video < 0) { mv->host.CloseAllPopups(); done(); return; }
+                checkSub(root, video, "mini player", false, ^(puimac::MenuPopup* sub) {
+                    const int painted = menuwindows::PaintCount(sub);
+                    [self key:124 chars:@""];   // Right: into the submenu, first item highlighted
+                    [self after:0.15 run:^{
+                        check(sub && root->SubMenu() == sub && sub->Highlight() == 0 && mv->host.Focused() == sub && menuwindows::PaintCount(sub) > painted,
+                              "mini player: Right moves into the submenu and its window repaints the highlight");
+                        [self key:53 chars:@"\x1b"];
+                        check(mv->host.PopupCount() == 1 && menuwindows::OpenWindows() == 1 && !windowOf(root->SubMenu()),
+                              "mini player: Escape closes the submenu and its window");
+                        [self key:53 chars:@"\x1b"];
+                        check(closed(), "mini player: Escape again closes the menu and its window");
+                        done();
+                    }];
+                });
+            }];
+        }];
+    }];
+    // the mini player: clicks through the menu windows run items
+    [steps addObject:^(void (^done)(void)) {
+        const pui::PointF at{mv->Layout().video.l / mv->Scale() + 40, mv->Layout().video.t / mv->Scale() + 30};
+        auto clickZoom = ^bool {
+            puimac::MenuPopup* root = openMenu(at);
+            const int video = indexOf(root, app::Tr(L"Video", L"영상"));
+            NSPanel* w = windowOf(root);
+            if (!root || video < 0 || !w) { mv->host.CloseAllPopups(); return false; }
+            [w sendEvent:[self menuWindowEvent:NSEventTypeLeftMouseDown at:rowCentre(root, video) window:w]];
+            [w sendEvent:[self menuWindowEvent:NSEventTypeLeftMouseUp at:rowCentre(root, video) window:w]];
+            puimac::MenuPopup* sub = root->SubMenu();
+            const int zoom = indexOf(sub, app::Tr(L"Zoom to fill", L"화면 채우기"));
+            NSPanel* sw = windowOf(sub);
+            if (!sub || zoom < 0 || !sw) { mv->host.CloseAllPopups(); return false; }
+            [sw sendEvent:[self menuWindowEvent:NSEventTypeLeftMouseDown at:rowCentre(sub, zoom) window:sw]];
+            [sw sendEvent:[self menuWindowEvent:NSEventTypeLeftMouseUp at:rowCentre(sub, zoom) window:sw]];
+            return true;
+        };
+        auto zoomShown = ^int {   // Zoom to fill's check in a freshly opened menu
+            puimac::MenuPopup* root = openMenu(at);
+            const pui::MenuItemDesc* d = app::nativemenu::FindItem(app::nativemenu::LastShown(), app::Tr(L"Zoom to fill", L"화면 채우기"));
+            const int v = root && d ? (d->checked ? 1 : 0) : -1;
+            mv->host.CloseAllPopups();
+            return v;
+        };
+        const bool before = app::IsZoomToFill();
+        const bool clicked = clickZoom();
+        const bool closedByItem = closed();
+        // the item's action runs after the menu closed (posted, as Windows runs it after TrackPopupMenuEx returns)
+        [self waitFor:^bool { return app::IsZoomToFill() != before; } seconds:2 then:^{
+            const bool flipped = app::IsZoomToFill() != before && zoomShown() == (before ? 0 : 1);
+            const bool clickedBack = clicked && clickZoom();
+            [self waitFor:^bool { return app::IsZoomToFill() == before; } seconds:2 then:^{
+                check(clicked && closedByItem && flipped && clickedBack && app::IsZoomToFill() == before,
+                      "mini player: clicks in the menu windows open Video's submenu and run Zoom to fill (menus and windows closed, the check flips; clicked again it flips back)");
+                done();
+            }];
+        }];
+    }];
+    // the mini player: a press outside, the app deactivating, the window starting to move and a press in another
+    //     window close the menus
+    [steps addObject:^(void (^done)(void)) {
+        const pui::PointF at{mv->Layout().video.l / mv->Scale() + 40, mv->Layout().video.t / mv->Scale() + 30};
+        // a press in the player window outside the menu
+        puimac::MenuPopup* root = openMenu(at);
+        pui::PointF outside{-1, -1};
+        const pui::SizeF client = mv->host.Size();
+        for (float y = 16; root && outside.x < 0 && y < client.h; y += 16)   // empty video, not the menu, not a MiniBar control
+            for (float x = 16; x < client.w; x += 16)
+                if (!root->Bounds().Contains({x, y}) && mv->IsVideoPoint({x, y}) && mv->shell->HitTest({x, y}) == mv->shell) { outside = {x, y}; break; }
+        const bool opened = root && menuwindows::OpenWindows() == 1;
+        if (outside.x >= 0) [self click:outside];
+        check(opened && outside.x >= 0 && closed(), "mini player: a press in the player window outside the menu closes it and its window");
+        auto closesOn = ^bool(NSNotificationName name, id object) {
+            puimac::MenuPopup* m = openMenu(at);
+            const bool shown = m && menuwindows::OpenWindows() == 1;
+            [NSNotificationCenter.defaultCenter postNotificationName:name object:object];
+            return shown && closed();
+        };
+        check(closesOn(NSApplicationDidResignActiveNotification, NSApp), "mini player: the app deactivating closes the menu");
+        check(closesOn(NSWindowWillMoveNotification, self->_window), "mini player: the player window starting to move closes the menu");
+        // a press in another window of the app, through the event queue (AppKit's local event monitors see it there)
+        NSWindow* other = [[NSWindow alloc] initWithContentRect:NSMakeRect(NSMinX(screenFrame(self->_window.frame)) + 4, NSMinY(screenFrame(self->_window.frame)) + 4, 40, 40)
+                                                      styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+        other.releasedWhenClosed = NO;
+        [other orderFront:nil];
+        root = openMenu(at);
+        const bool shown = root && menuwindows::OpenWindows() == 1;
+        for (NSEventType t : {NSEventTypeLeftMouseDown, NSEventTypeLeftMouseUp})
+            [NSApp postEvent:[NSEvent mouseEventWithType:t location:NSMakePoint(20, 20) modifierFlags:0 timestamp:NSProcessInfo.processInfo.systemUptime
+                                            windowNumber:other.windowNumber context:nil eventNumber:0 clickCount:1 pressure:1] atStart:NO];
+        [self waitFor:^bool { return closed(); } seconds:2 then:^{
+            check(shown && closed(), "mini player: a press in another window of the app closes the menu");
+            [other orderOut:nil];
+            mv->host.CloseAllPopups();
+            mv->Execute(app::CommandId::ToggleMiniPlayer);
+            [self after:0.6 run:done];
+        }];
+    }];
+    // a small main window at the bottom-right corner of the visible frame: the menu flips left and above the click,
+    //     its submenu opens to its left
+    [steps addObject:^(void (^done)(void)) {
+        savedFrame = self->_window.frame;
+        const NSRect vf = screenFrame(savedFrame);
+        [self->_window setFrame:NSMakeRect(NSMaxX(vf) - 420, NSMinY(vf), 420, 300) display:YES];
+        [self after:0.5 run:^{
+            const pui::PointF at{mv->Layout().video.r / mv->Scale() - 16, mv->Layout().video.b / mv->Scale() - 16};
+            puimac::MenuPopup* root = openMenu(at);
+            const int video = indexOf(root, app::Tr(L"Video", L"영상"));
+            [self after:0.2 run:^{
+                checkFits(root, at, "small main window", true);
+                if (!root || video < 0) { mv->host.CloseAllPopups(); done(); return; }
+                checkSub(root, video, "small main window", true, ^(puimac::MenuPopup* sub) {
+                    (void)sub;
+                    [self key:53 chars:@"\x1b"];
+                    [self key:53 chars:@"\x1b"];
+                    check(closed(), "small main window: Escape twice closes the submenu and the menu with their windows");
+                    [self->_window setFrame:savedFrame display:YES];
+                    [self after:0.5 run:done];
+                });
+            }];
+        }];
+    }];
+    [steps addObject:^(void (^done)(void)) { (void)done; next(); }];
+    [self runSteps:steps];
+}
+
+/// Popups close where the Windows app closes them (PopupDismissMac; App / SettingsWindow WM_ACTIVATE WA_INACTIVE, App
+/// SIZE_MINIMIZED): the player window losing key closes all its popups (a menu and the notice), not while one of the
+/// app's own modal dialogs has the keyboard; miniaturising closes them; the Settings window losing key closes its
+/// flyouts and keeps the caption style editor (Windows' owned font dialog); closing it closes its popups.
+- (void)runPopupDismissTests:(void (^)(bool, const char*))check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    const pui::PointF at{mv->Layout().video.l / mv->Scale() + 40, mv->Layout().video.t / mv->Scale() + 30};
+    auto openPopups = ^bool {   // the app-owned notice and the video context menu beside it
+        mv->ShowInfoBar(app::InfoSeverity::Informational, L"Self-test notice", L"Popup dismissal");
+        [self->_shell rightMouseDown:[self mouseEvent:NSEventTypeRightMouseDown at:at clicks:1]];
+        [self->_shell rightMouseUp:[self mouseEvent:NSEventTypeRightMouseUp at:at clicks:1]];
+        return mv->host.PopupCount() == 2 && dynamic_cast<puimac::MenuPopup*>(mv->host.TopPopup()) && menuwindows::OpenWindows() == 1;
+    };
+    // `w` stops being the key window: another window becomes key (AppKit), or, where `w` is not key (an inactive
+    // session), AppKit's resign-key notification is posted; `then` runs once the deferred decision ran, then `w` is key again
+    auto resignKey = ^(NSWindow* w, void (^then)(const char* how)) {
+        if (!w.keyWindow) {
+            [NSNotificationCenter.defaultCenter postNotificationName:NSWindowDidResignKeyNotification object:w];
+            [self after:0.2 run:^{ then("not key in this session: its resign-key notification posted"); }];
+            return;
+        }
+        NSWindow* other = [[NSWindow alloc] initWithContentRect:NSMakeRect(NSMinX(w.frame) + 20, NSMinY(w.frame) + 20, 160, 90)
+                                                      styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+        other.releasedWhenClosed = NO;
+        [other makeKeyAndOrderFront:nil];
+        [self waitFor:^bool { return !w.keyWindow; } seconds:2 then:^{
+            [self after:0.2 run:^{
+                then(w.keyWindow ? "another window did not become key" : "another window became key");
+                [other orderOut:nil];
+                [w makeKeyAndOrderFront:nil];
+            }];
+        }];
+    };
+    NSMutableArray<SelfTestStep>* steps = [NSMutableArray array];
+    [steps addObject:^(void (^done)(void)) {
+        const bool opened = openPopups();
+        resignKey(self->_window, ^(const char* how) {
+            char what[240];
+            snprintf(what, sizeof what, "the player window losing key closes all its popups, the menu with its window and the notice (%s)", how);
+            check(opened && mv->host.PopupCount() == 0 && menuwindows::OpenWindows() == 0, what);
+            done();
+        });
+    }];
+    [steps addObject:^(void (^done)(void)) {
+        mv->ShowInfoBar(app::InfoSeverity::Informational, L"Self-test notice", L"Popup dismissal");
+        const bool wasKey = self->_window.keyWindow;
+        // The alert runs from a timer, not from this main-queue block: during the modal session the main queue runs, so
+        // the resign-key decision is taken while the alert has the keyboard (NSApp.modalWindow), as for a dialog opened
+        // from a key equivalent. A modal-mode timer ends it.
+        NSTimer* show = [NSTimer timerWithTimeInterval:0.05 repeats:NO block:^(NSTimer* t) {
+            (void)t;
+            __block size_t during = 0;
+            __block bool alertKey = false;
+            NSAlert* alert = [[NSAlert alloc] init];
+            alert.messageText = @"Self-test";
+            NSTimer* end = [NSTimer timerWithTimeInterval:0.6 repeats:NO block:^(NSTimer* t2) {
+                (void)t2;
+                during = mv->host.PopupCount();
+                alertKey = NSApp.keyWindow == alert.window;
+                [NSApp abortModal];   // stopModal waits for another event
+            }];
+            [NSRunLoop.currentRunLoop addTimer:end forMode:NSModalPanelRunLoopMode];
+            [alert runModal];
+            char what[240];
+            snprintf(what, sizeof what, "an app-modal dialog (the NSAlert prompts, NSOpenPanel) keeps the player window's popups (the player window was key: %s, the alert took it: %s)",
+                     wasKey ? "yes" : "no", alertKey ? "yes" : "no");
+            check(during == 1 && mv->host.PopupCount() == 1, what);
+            [self after:0.3 run:^{
+                check(mv->host.PopupCount() == 1, "and keeps them after it closed");
+                mv->host.CloseAllPopups();
+                [self->_window makeKeyAndOrderFront:nil];
+                [self after:0.3 run:done];
+            }];
+        }];
+        [NSRunLoop.currentRunLoop addTimer:show forMode:NSDefaultRunLoopMode];
+    }];
+    [steps addObject:^(void (^done)(void)) {
+        const bool opened = openPopups();
+        const bool real = ![AppDelegate screenLocked];
+        if (real) [self->_window miniaturize:nil];
+        else [NSNotificationCenter.defaultCenter postNotificationName:NSWindowWillMiniaturizeNotification object:self->_window];
+        [self waitFor:^bool { return mv->host.PopupCount() == 0; } seconds:3 then:^{
+            char what[200];
+            snprintf(what, sizeof what, "miniaturising the player window closes its popups (%s)", real ? "miniaturize:" : "the session is locked: its will-miniaturize notification posted");
+            check(opened && mv->host.PopupCount() == 0 && menuwindows::OpenWindows() == 0, what);
+            if (self->_window.miniaturized || real) [self->_window deminiaturize:nil];
+            [self waitFor:^bool { return !self->_window.miniaturized; } seconds:5 then:^{
+                check(!self->_window.miniaturized, "and the window comes back");
+                [self->_window makeKeyAndOrderFront:nil];
+                [self after:0.3 run:done];
+            }];
+        }];
+    }];
+    [steps addObject:^(void (^done)(void)) {
+        [self openSettings];
+        NSWindow* sw = (__bridge NSWindow*)self->_settings->Window();
+        pui::UiHost& host = self->_settings->Ui();
+        pui::Widget* page = self->_settings->Page();
+        auto* source = dynamic_cast<pui::ToggleSwitch*>(FindById(page, L"SubtitleUseWindowsToggle"));
+        const bool sourceWas = source && source->IsOn();
+        if (source) source->SetOn(false);
+        if (pui::Widget* fontButton = FindById(page, L"SubtitleFontButton")) fontButton->Invoke();
+        pui::Widget* editor = host.TopPopup();
+        auto* fonts = dynamic_cast<pui::ComboBox*>(FindById(editor, L"SubtitleFontFamilyCombo"));
+        if (fonts) fonts->Open();
+        const bool opened = editor && fonts && fonts->IsOpen() && host.PopupCount() == 2;
+        [self after:0.3 run:^{
+            resignKey(sw, ^(const char* how) {
+                char what[260];
+                snprintf(what, sizeof what, "the Settings window losing key closes its flyout and keeps the caption style editor (%s)", how);
+                check(opened && host.PopupCount() == 1 && host.TopPopup() == editor, what);
+                if (fonts) fonts->Open();
+                self->_settings->Close();
+                check(host.PopupCount() == 0 && !self->_settings->IsOpen(), "closing the Settings window closes its popups");
+                if (source && sourceWas) source->SetOn(true);
+                [self->_window makeKeyAndOrderFront:nil];
+                [self after:0.3 run:done];
+            });
+        }];
+    }];
+    [steps addObject:^(void (^done)(void)) { (void)done; next(); }];
+    [self runSteps:steps];
 }
 
 - (void)runSubtitleTests:(void (^)(bool, const char*))check next:(void (^)(void))done {
@@ -2258,6 +2603,10 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
             }];
         }];
     }];
+    // menus in their own windows: the mini player and a small main window do not clip them
+    [steps addObject:^(void (^next)(void)) { [self runMenuWindowTests:check next:next]; }];
+    // popups close on deactivation, miniaturise and close (App WM_ACTIVATE / SIZE_MINIMIZED)
+    [steps addObject:^(void (^next)(void)) { [self runPopupDismissTests:check next:next]; }];
     // mini player and back
     [steps addObject:^(void (^next)(void)) {
         const NSRect before = self->_window.frame;
