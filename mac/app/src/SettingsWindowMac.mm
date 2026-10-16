@@ -13,6 +13,7 @@
 #include "LoggingMac.h"
 #include "MainView.h"
 #include "PuiHostView.h"
+#include "features/FiltersPanel.h"
 #include "features/SettingsLogic.h"
 #include "features/SettingsService.h"
 #include "pages/SettingsPage.h"
@@ -456,7 +457,18 @@ struct SettingsWindow::Impl {
     SettingsWindowDelegate* delegate = nil;
     Root* root = nullptr;
     pui::Widget* page = nullptr;
+    bool inFront = false;            // a press on the player put it in front of this window (SettingsWindow::inFront_)
+    bool hiddenForPlayer = false;    // hidden while the player is minimized
     explicit Impl(MainView& m) : mv(m) {}
+    NSWindow* Player() const { return (__bridge NSWindow*)(void*)mv.MainHwnd(); }
+    bool Shown() const { return window.visible && !hiddenForPlayer; }
+    /// Directly above the player, without activation, in the player's band.
+    void RaiseAbove() {
+        NSWindow* player = Player();
+        if (!player) return;
+        if (window.level != player.level) window.level = player.level;
+        [window orderWindow:NSWindowAbove relativeTo:player.windowNumber];
+    }
 };
 
 SettingsWindow::SettingsWindow(MainView& mv) : impl_(std::make_unique<Impl>(mv)) {
@@ -471,7 +483,8 @@ SettingsWindow::SettingsWindow(MainView& mv) : impl_(std::make_unique<Impl>(mv))
     d.window.minSize = NSMakeSize(kMinW, kMinH);
     d.window.releasedWhenClosed = NO;
     d.window.tabbingMode = NSWindowTabbingModeDisallowed;
-    d.window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
+    // Managed: like a normal-level window in Spaces and Mission Control at the player's floating level too.
+    d.window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorManaged;
     d.delegate = [[SettingsWindowDelegate alloc] init];
     d.delegate.owner = this;
     d.window.delegate = d.delegate;
@@ -488,6 +501,8 @@ SettingsWindow::SettingsWindow(MainView& mv) : impl_(std::make_unique<Impl>(mv))
     [d.view setThemeMaker:[m](float scale) { return m->MakeTheme(scale); }];
     pui::UiHost* host = &d.host;
     [d.view setOnResize:[host](NSSize s) { host->SetSize({(float)s.width, (float)s.height}); }];
+    SettingsWindow* self = this;
+    [d.view setOnEscape:[self] { self->Close(); }];   // Esc closes the window once no flyout / dialog took it
 }
 
 SettingsWindow::~SettingsWindow() {
@@ -510,6 +525,15 @@ void SettingsWindow::Open() {
         env.host = &d.host;
         env.owner = (HWND)(__bridge void*)d.window;
         SettingsWindow* self = this;
+        // SettingsWindow::EditFilters: the filters panel is a popup of the player window, which Settings could cover, so
+        // Settings closes first; posted, since the click handler runs inside the page that closing tears down.
+        env.editFilters = [self] {
+            MainView& mv = self->impl_->mv;
+            mv.PostToUi([self, &mv] {
+                self->Close();
+                app::ShowFiltersPanel(mv, app::FiltersTab::Video);
+            });
+        };
         env.launchUri = [self](const wchar_t* uri) {
             std::string u = wvp::ToUtf8(uri);
             if (u.rfind("ms-settings:easeofaccess-closedcaptioning", 0) == 0) u = kCaptionSettingsUrl;   // Windows Settings > Captions
@@ -552,8 +576,10 @@ void SettingsWindow::Open() {
             }
         }
     }
+    d.hiddenForPlayer = false;
     [d.window makeKeyAndOrderFront:nil];
     [d.window makeFirstResponder:d.view];
+    StartFocusCycle();
     [d.view afterEvent];
 }
 
@@ -565,10 +591,48 @@ void SettingsWindow::Close() {
         d.mv.Svc().settingsStore.Save(d.mv.Svc().settings);
     }
     d.host.CloseAllPopups();
+    d.hiddenForPlayer = false;
     [d.window orderOut:nil];
 }
 
-bool SettingsWindow::IsOpen() const { return impl_->window.visible; }
+bool SettingsWindow::IsOpen() const { return impl_->window.visible || impl_->hiddenForPlayer; }
+
+void SettingsWindow::StartFocusCycle() {
+    Impl& d = *impl_;
+    if (!d.Shown()) return;
+    d.inFront = false;
+    d.RaiseAbove();
+}
+
+void SettingsWindow::OnPlayerPressed() {
+    Impl& d = *impl_;
+    if (!d.Shown() || d.inFront) return;
+    d.inFront = true;
+    // Out of the topmost band; below a player that is not in it.
+    if (d.window.level != NSNormalWindowLevel) d.window.level = NSNormalWindowLevel;
+    NSWindow* player = d.Player();
+    if (player && player.level == NSNormalWindowLevel) [d.window orderWindow:NSWindowBelow relativeTo:player.windowNumber];
+}
+
+void SettingsWindow::KeepAbove() {
+    Impl& d = *impl_;
+    if (d.Shown() && !d.inFront) d.RaiseAbove();
+}
+
+void SettingsWindow::OnPlayerMinimized(bool minimized) {
+    Impl& d = *impl_;
+    if (minimized) {
+        if (!d.window.visible) return;
+        d.hiddenForPlayer = true;
+        d.host.CloseAllPopups();
+        [d.window orderOut:nil];
+    } else if (d.hiddenForPlayer) {
+        d.hiddenForPlayer = false;
+        d.RaiseAbove();   // orders it in without making it key
+    }
+}
+
+bool SettingsWindow::PlayerInFront() const { return impl_->inFront; }
 
 void SettingsWindow::ApplyTheme() { [impl_->view applyTheme]; }
 

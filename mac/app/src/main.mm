@@ -27,6 +27,7 @@
 //   Settings > About > Debug logging writes ~/Library/Logs/aribplayer/aribplayer-YYYYMMDD.log (LoggingMac.h).
 #import <AppKit/AppKit.h>
 #import <VideoToolbox/VideoToolbox.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 
 #include <algorithm>
 #include <cmath>
@@ -51,6 +52,7 @@
 #include "ShellView.h"
 #include "VideoView.h"
 #include "WindowSizing.h"
+#include "features/FiltersPanel.h"
 #include "features/Logging.h"
 #include "features/MiniLogic.h"
 #include "features/OpenFlows.h"
@@ -196,6 +198,8 @@ pui::Widget* FindById(pui::Widget* w, const std::wstring& id) {
     int _expectOpen;
     int _persistPhase;
     NSHashTable<NSMenuItem*>* _appMenuItems; // distinguish app-owned items from AppKit's Services/window additions
+    id _pressMonitor;                         // mouse buttons pressed on the player (the Settings z-order)
+    bool _skipActivationPress;                // App::skipActivationPress_: the click that activated the app
 }
 
 // --- menu bar (native, Mac conventions; the app's own menu is the pui main menu on the hamburger / video) -----------
@@ -438,7 +442,9 @@ static NSEventModifierFlags MacMods(unsigned m) {
     _window.titlebarAppearsTransparent = YES;
     _window.titleVisibility = NSWindowTitleHidden;
     _window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
-    _window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+    // Managed: always on top (the floating level) keeps the window in its Space and in Mission Control, as a topmost
+    // window stays on its virtual desktop and in Task View on Windows; it can still enter full screen.
+    _window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary | NSWindowCollectionBehaviorManaged;
     _window.tabbingMode = NSWindowTabbingModeDisallowed;
     _window.minSize = NSMakeSize(500, 374);
     _window.delegate = self;
@@ -478,7 +484,17 @@ static NSEventModifierFlags MacMods(unsigned m) {
     _mv->hooks.sizeWindowToVideo = [weakSelf](const wvp::MediaPreparedInfo& p, double scale) { return (bool)[weakSelf sizeWindowToVideo:p scale:scale]; };
     _mv->hooks.applyTopmost = [weakSelf](bool on) {
         AppDelegate* s = weakSelf;
-        if (s && !s->_mv->IsMiniPlayer()) s->_window.level = on ? NSFloatingWindowLevel : NSNormalWindowLevel;
+        if (!s || s->_mv->IsMiniPlayer()) return;
+        s->_window.level = on ? NSFloatingWindowLevel : NSNormalWindowLevel;
+        if (s->_settings) s->_settings->KeepAbove();   // App::NoteTopmostReasserted
+    };
+    _mv->hooks.cursorAt = [weakSelf]() -> std::optional<pui::PointF> {
+        AppDelegate* s = weakSelf;
+        if (!s || !NSApp.isActive || !s->_window.visible || s->_window.miniaturized) return std::nullopt;
+        const NSPoint screen = NSEvent.mouseLocation;
+        if ([NSWindow windowNumberAtPoint:screen belowWindowWithWindowNumber:0] != s->_window.windowNumber) return std::nullopt;
+        const NSPoint p = [s->_shell convertPoint:[s->_window convertPointFromScreen:screen] fromView:nil];
+        return pui::PointF{(float)p.x, (float)p.y};
     };
     _mv->hooks.applyTheme = [weakSelf](pui::ThemeMode m, std::uint32_t) { [weakSelf setAppearance:m]; };
     _mv->hooks.miniPlayer = [weakSelf](bool on) { AppDelegate* s = weakSelf; if (s) { [s->_shell relayout]; if (!on) [s relayoutTrafficLightsSoon]; } };
@@ -509,6 +525,15 @@ static NSEventModifierFlags MacMods(unsigned m) {
     [self layoutTrafficLights];
     // system light/dark switches don't go through setAppearance:
     [NSApp addObserver:self forKeyPath:@"effectiveAppearance" options:0 context:&kAppearanceKVO];
+
+    // App::NotePlayerPressed: any mouse button pressed on the player (title strip, traffic lights, video, bar), whether or
+    // not it is key; never consumed.
+    _pressMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
+                                                          handler:^NSEvent*(NSEvent* e) {
+        AppDelegate* s = weakSelf;
+        if (s && e.window == s->_window) [s notePlayerPressed];
+        return e;
+    }];
 
     _modelTick = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer*) {
         AppDelegate* s = weakSelf;
@@ -544,6 +569,31 @@ static NSEventModifierFlags MacMods(unsigned m) {
     _settings->Open();
 }
 
+- (void)notePlayerPressed {
+    if (_skipActivationPress) {
+        // The activating click: AppKit brings the clicked player to the front when it dispatches the press, after the
+        // focus cycle put Settings above it; Settings goes back above it once the press is handled (Windows' order).
+        _skipActivationPress = false;
+        __weak AppDelegate* weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ AppDelegate* s = weakSelf; if (s && s->_settings) s->_settings->KeepAbove(); });
+        return;
+    }
+    if (_settings) _settings->OnPlayerPressed();
+}
+
+// The Settings window's focus cycle (App's WM_ACTIVATE from another process / WM_ACTIVATEAPP): the app came back from
+// another application, so Settings goes above the player again; the click that did it is not a press on the player.
+- (void)applicationDidBecomeActive:(NSNotification*)n {
+    (void)n;
+    _skipActivationPress = NSEvent.pressedMouseButtons != 0;
+    if (_settings) _settings->StartFocusCycle();
+}
+
+- (void)applicationDidResignActive:(NSNotification*)n {
+    (void)n;
+    if (_mv) _mv->ApplyWindowTopmost();   // re-asserts the level; Settings stays above unless the player is in front
+}
+
 - (void)setAppearance:(pui::ThemeMode)m {
     NSApp.appearance = m == pui::ThemeMode::Dark ? [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]
                      : m == pui::ThemeMode::Light ? [NSAppearance appearanceNamed:NSAppearanceNameAqua] : nil;
@@ -574,14 +624,16 @@ static NSEventModifierFlags MacMods(unsigned m) {
     if (!NSEqualRects(_video.frame, f)) _video.frame = f;
 }
 
-/// App::ResizeWindowForPlaylistPanel: the right edge moves by the panel width + gap so the video keeps its size.
+/// App::ResizeWindowForPlaylistPanel: the right edge moves by the panel width + gap so the video keeps its size, never
+/// below the window's minimum width (kMinWindowWidthDip). A zoomed (maximized) or minimized window keeps its frame and
+/// the video resizes instead (App::TogglePlaylistPanel's !IsZoomed / !IsIconic).
 - (void)resizeForPanel:(int)videoW wanted:(bool)wanted {
     (void)videoW;
-    if (_window.styleMask & NSWindowStyleMaskFullScreen) { [_shell relayout]; return; }
+    if ((_window.styleMask & NSWindowStyleMaskFullScreen) || _window.zoomed || _window.miniaturized) { [_shell relayout]; return; }
     const CGFloat delta = (_mv->Svc().settings.playlistPanelWidthDip + app::kBodyGapDip) * (wanted ? 1 : -1);
     NSRect f = _window.frame;
     NSRect work = _window.screen ? _window.screen.visibleFrame : NSZeroRect;
-    f.size.width += delta;
+    f.size.width = std::max(f.size.width + delta, _window.minSize.width);
     if (!NSIsEmptyRect(work)) {
         if (NSMaxX(f) > NSMaxX(work)) f.origin.x = std::max(NSMinX(work), NSMaxX(work) - NSWidth(f));
         if (NSWidth(f) > NSWidth(work)) f.size.width = NSWidth(work);
@@ -663,6 +715,8 @@ static NSEventModifierFlags MacMods(unsigned m) {
 - (void)windowDidChangeScreen:(NSNotification*)n { (void)n; if (_mv) _mv->Eng().DisplayChanged(); }
 - (void)windowDidEndLiveResize:(NSNotification*)n { (void)n; [self layoutTrafficLights]; }
 - (void)windowDidBecomeKey:(NSNotification*)n { (void)n; [self layoutTrafficLights]; [_shell setNeedsDisplay:YES]; }
+- (void)windowDidMiniaturize:(NSNotification*)n { (void)n; if (_settings) _settings->OnPlayerMinimized(true); }
+- (void)windowDidDeminiaturize:(NSNotification*)n { (void)n; if (_settings) _settings->OnPlayerMinimized(false); }
 - (void)windowDidResignKey:(NSNotification*)n { (void)n; [self layoutTrafficLights]; [_shell setNeedsDisplay:YES]; }
 - (void)windowDidEnterFullScreen:(NSNotification*)n { (void)n; _mv->SetFullscreenState(true); [_shell afterEvent]; }
 - (void)windowDidExitFullScreen:(NSNotification*)n { (void)n; _mv->SetFullscreenState(false); [self relayoutTrafficLightsSoon]; [_shell afterEvent]; }
@@ -673,6 +727,7 @@ static NSEventModifierFlags MacMods(unsigned m) {
     (void)n;
     [_modelTick invalidate];
     [_statsTimer invalidate];
+    if (_pressMonitor) { [NSEvent removeMonitor:_pressMonitor]; _pressMonitor = nil; }
     if (_settings) _settings->Close();
     if (_mv) _mv->Shutdown();   // settings.json (window placement, current playlist), the resume position
     _settings.reset();
@@ -2258,6 +2313,10 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
             }];
         }];
     }];
+    // parity with the Windows app: keep awake, Space / wheel, chips, the playlist's key target, typed menu keys and Cmd+C,
+    //     panel resizing, toasts, the full-screen cursor, the mini bar's auto-hide and aspect, Settings keys and the
+    //     always-on-top band
+    [steps addObject:^(void (^next)(void)) { [self runParityChecks:check next:next]; }];
     // mini player and back
     [steps addObject:^(void (^next)(void)) {
         const NSRect before = self->_window.frame;
@@ -2304,6 +2363,656 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
         exit(failures == 0 ? 0 : 2);
     }];
     [self runSteps:steps];
+}
+
+// --- self-test: parity with the Windows app (keep awake, cursor, Settings window, panel resizing, mini player, input) ----
+
+typedef void (^ParityCheck)(bool, const char*);
+
+/// Synthesised key events for a view (never posted to the desktop).
+- (NSEvent*)keyEvent:(NSEventType)type code:(unsigned short)code chars:(NSString*)chars mods:(NSEventModifierFlags)mods
+              repeat:(BOOL)repeat window:(NSWindow*)w {
+    return [NSEvent keyEventWithType:type location:NSZeroPoint modifierFlags:mods timestamp:NSProcessInfo.processInfo.systemUptime
+                        windowNumber:w.windowNumber context:nil characters:chars charactersIgnoringModifiers:chars isARepeat:repeat keyCode:code];
+}
+
+/// A scroll event at a shell-view point, delivered to the shell view's scrollWheel: (as the Settings scrolling checks).
+- (BOOL)scrollShellAt:(pui::PointF)p unit:(CGScrollEventUnit)unit delta:(int)delta momentum:(CGMomentumScrollPhase)momentum {
+    CGEventRef cg = CGEventCreateScrollWheelEvent2(nullptr, unit, 1, delta, 0, 0);
+    if (!cg) return NO;
+    const NSPoint at = [_shell convertPoint:NSMakePoint(p.x, p.y) toView:nil];
+    CGEventSetLocation(cg, CGPointMake(at.x, NSMaxY(NSScreen.screens.firstObject.frame) - at.y));
+    CGEventSetFlags(cg, 0);
+    if (unit == kCGScrollEventUnitPixel) {
+        CGEventSetIntegerValueField(cg, kCGScrollWheelEventScrollPhase, momentum == kCGMomentumScrollPhaseNone ? kCGScrollPhaseChanged : 0);
+        CGEventSetIntegerValueField(cg, kCGScrollWheelEventMomentumPhase, momentum);
+    }
+    NSEvent* e = [NSEvent eventWithCGEvent:cg];
+    CFRelease(cg);
+    if (!e || e.type != NSEventTypeScrollWheel) return NO;
+    @try { [_shell scrollWheel:e]; }
+    @catch (NSException* ex) { printf("     scroll exception: %s\n", ex.reason.UTF8String); return NO; }
+    return YES;
+}
+
+/// Front-to-back position of a window among the on-screen windows (the window server's order), else NSApp's order.
+- (NSInteger)zIndexOf:(NSWindow*)w {
+    NSArray* list = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID));
+    NSInteger i = 0;
+    for (NSDictionary* d in list) {
+        if ([d[(__bridge NSString*)kCGWindowNumber] integerValue] == w.windowNumber) return i;
+        i++;
+    }
+    return 100000 + [NSApp.orderedWindows indexOfObject:w];
+}
+
+/// `a` is in front of `b` in the window server's order. AppKit sends ordering changes to the server as its run loop turns:
+/// up to 0.5 s of it.
+- (bool)window:(NSWindow*)a inFrontOf:(NSWindow*)b {
+    for (int i = 0; i < 10; i++) {
+        if ([self zIndexOf:a] < [self zIndexOf:b]) return true;
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+    return false;
+}
+
+/// Keys through AppKit's own dispatch when the player is the key window of the active app: posted to this app's event
+/// queue (never the desktop's), so -[NSApplication sendEvent:] runs with them as the current event (menu key
+/// equivalents, the key window). Without a key window (a locked session) the order the CI runs measured there: a key
+/// with Command / Control through the menu bar's key equivalents, any other to the first responder's keyDown:.
+/// `done(real)` runs once they were handled.
+- (void)routeKeys:(NSArray<NSEvent*>*)events then:(void (^)(bool real))done {
+    if (_window.isKeyWindow && NSApp.isActive) {
+        for (NSEvent* e in events) [NSApp postEvent:e atStart:NO];
+        [self after:0.4 run:^{ done(true); }];
+        return;
+    }
+    NSResponder* fr = _window.firstResponder ?: _shell;
+    for (NSEvent* e in events) {
+        if (e.type == NSEventTypeKeyUp) { [fr keyUp:e]; continue; }
+        const bool command = (e.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) != 0;
+        if (!command || ![NSApp.mainMenu performKeyEquivalent:e]) [fr keyDown:e];
+    }
+    done(false);
+}
+
+/// The 30 s H.264 clip from its start: checks that need playback to keep going for several seconds (the other clips
+/// are 1-12 s, and an ended clip changes the state they depend on).
+- (void)playLongClip:(void (^)(void))then {
+    const auto& items = _mv->Ctl().Items();
+    for (size_t i = 0; i < items.size(); i++)
+        if (items[i].url.size() >= 20 && items[i].url.compare(items[i].url.size() - 20, 20, "av_1080p_h264_aac.ts") == 0) {
+            _mv->Ctl().PlayAt((int)i, 0);
+            break;
+        }
+    [self waitFor:^bool { return [self playingUrlEnding:"av_1080p_h264_aac.ts" past:0.3]; } seconds:10 then:then];
+}
+
+- (int)ownAssertions:(CFStringRef)type {
+    CFDictionaryRef byPid = nullptr;
+    if (IOPMCopyAssertionsByProcess(&byPid) != kIOReturnSuccess || !byPid) return -1;
+    NSDictionary* all = CFBridgingRelease(byPid);
+    int n = 0;
+    for (NSDictionary* a in (NSArray*)all[@(getpid())])
+        if ([a[(__bridge NSString*)kIOPMAssertionTypeKey] isEqualToString:(__bridge NSString*)type]) n++;
+    return n;
+}
+
+- (void)runParityChecks:(ParityCheck)check next:(void (^)(void))done {
+    NSMutableArray<SelfTestStep>* steps = [NSMutableArray array];
+    [steps addObject:^(void (^next)(void)) { [self parityKeepAwake:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self paritySpaceAndWheel:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self parityChips:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self parityPanelTarget:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self parityTypingAndCopy:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self parityPanelResize:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self parityToast:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self parityCursor:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self parityMiniPlayer:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self paritySettingsKeys:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { [self parityTopmost:check next:next]; }];
+    [steps addObject:^(void (^next)(void)) { (void)next; done(); }];
+    [self runSteps:steps];
+}
+
+/// #1 App::UpdateKeepAwake: a display assertion while video plays; none paused, stopped or closed.
+- (void)parityKeepAwake:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    wvp::FfPlayer* player = mv->Player();
+    [self queueClips];
+    [self waitFor:^bool { return [self playingIndex:0 past:0.5]; } seconds:10 then:^{
+        using K = mainview::MainView::KeepAwake;
+        const CFStringRef display = kIOPMAssertionTypePreventUserIdleDisplaySleep;
+        check(mv->KeepAwakeState() == K::Display && [self ownAssertions:display] == 1,
+              "keep awake: playing video holds one PreventUserIdleDisplaySleep assertion (pmset -g assertions lists it)");
+        player->Pause();
+        [self waitFor:^bool { return player->State() == wvp::PlayerState::Paused && mv->KeepAwakeState() == K::None; } seconds:3 then:^{
+            check(mv->KeepAwakeState() == K::None && [self ownAssertions:display] == 0, "keep awake: paused releases it");
+            player->Play();
+            [self waitFor:^bool { return player->State() == wvp::PlayerState::Playing && mv->KeepAwakeState() == K::Display; } seconds:3 then:^{
+                check(mv->KeepAwakeState() == K::Display && [self ownAssertions:display] == 1, "keep awake: playing again takes it again");
+                mv->Execute(app::CommandId::Stop);
+                [self waitFor:^bool { return mv->Ctl().Current() == nullptr && mv->KeepAwakeState() == K::None; } seconds:3 then:^{
+                    check(mv->KeepAwakeState() == K::None && [self ownAssertions:display] == 0 &&
+                          [self ownAssertions:kIOPMAssertionTypePreventUserIdleSystemSleep] == 0, "keep awake: closing the media releases it");
+                    mv->Ctl().PlayAt(0);
+                    [self waitFor:^bool { return [self playingIndex:0 past:0.5]; } seconds:10 then:^{ next(); }];
+                }];
+            }];
+        }];
+    }];
+}
+
+/// #14 Space: a held key's auto-repeat does not toggle again. #15 the wheel: 1 % per notch over the video, the title strip
+/// and the bar's background; trackpad travel adds up (48 DIP a notch); momentum does not change the volume.
+- (void)paritySpaceAndWheel:(ParityCheck)check next:(void (^)(void))next {
+    [self playLongClip:^{ [self paritySpaceAndWheelPlaying:check next:next]; }];
+}
+
+- (void)paritySpaceAndWheelPlaying:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    wvp::FfPlayer* player = mv->Player();
+    app::ShellRoot* shell = mv->shell;
+    [_shell keyDown:[self keyEvent:NSEventTypeKeyDown code:49 chars:@" " mods:0 repeat:NO window:_window]];
+    [self waitFor:^bool { return player->State() == wvp::PlayerState::Paused; } seconds:3 then:^{
+        const bool paused = player->State() == wvp::PlayerState::Paused;
+        for (int k = 0; k < 3; k++) [self->_shell keyDown:[self keyEvent:NSEventTypeKeyDown code:49 chars:@" " mods:0 repeat:YES window:self->_window]];
+        [self after:0.5 run:^{
+            check(paused && player->State() == wvp::PlayerState::Paused, "Space pauses; three auto-repeats of the held key change nothing");
+            [self->_shell keyUp:[self keyEvent:NSEventTypeKeyUp code:49 chars:@" " mods:0 repeat:NO window:self->_window]];
+            [self->_shell keyDown:[self keyEvent:NSEventTypeKeyDown code:49 chars:@" " mods:0 repeat:NO window:self->_window]];
+            [self->_shell keyUp:[self keyEvent:NSEventTypeKeyUp code:49 chars:@" " mods:0 repeat:NO window:self->_window]];
+            [self waitFor:^bool { return player->State() == wvp::PlayerState::Playing; } seconds:3 then:^{
+                check(player->State() == wvp::PlayerState::Playing, "the next Space press plays again");
+                mv->Ctl().SetVolume(50);
+                const app::RectPx& v = mv->Layout().video;
+                const float s = mv->Scale();
+                const pui::PointF video{(v.l + v.r) / (2 * s), (v.t + v.b) / (2 * s)};
+                // an empty spot of the title strip and of the bar: no widget under it
+                std::optional<pui::PointF> strip, bar;
+                const pui::RectF t = mv->Layout().title, b = shell->Bar()->Bounds();
+                for (float x = t.r - 200; x > t.l + 90 && !strip; x -= 7) {
+                    pui::Widget* h = mv->host.HitTest({x, t.cy()});
+                    if (h == nullptr || h == shell || h == shell->Title()) strip = pui::PointF{x, t.cy()};
+                }
+                for (float x = b.l + 2; x < b.r && !bar; x += 5) {
+                    pui::Widget* h = mv->host.HitTest({x, b.b - 3});
+                    if (h == nullptr || h == shell || h == shell->Bar()) bar = pui::PointF{x, b.b - 3};
+                }
+                check(strip && bar, "the title strip and the bar have an empty spot");
+                int vol[6];
+                [self scrollShellAt:video unit:kCGScrollEventUnitLine delta:1 momentum:kCGMomentumScrollPhaseNone];
+                vol[0] = mv->Ctl().Volume();
+                if (strip) [self scrollShellAt:*strip unit:kCGScrollEventUnitLine delta:1 momentum:kCGMomentumScrollPhaseNone];
+                vol[1] = mv->Ctl().Volume();
+                if (bar) [self scrollShellAt:*bar unit:kCGScrollEventUnitLine delta:1 momentum:kCGMomentumScrollPhaseNone];
+                vol[2] = mv->Ctl().Volume();
+                [self scrollShellAt:video unit:kCGScrollEventUnitLine delta:-1 momentum:kCGMomentumScrollPhaseNone];
+                vol[3] = mv->Ctl().Volume();
+                [self scrollShellAt:video unit:kCGScrollEventUnitPixel delta:24 momentum:kCGMomentumScrollPhaseNone];
+                const int half = mv->Ctl().Volume();
+                [self scrollShellAt:video unit:kCGScrollEventUnitPixel delta:24 momentum:kCGMomentumScrollPhaseNone];
+                vol[4] = mv->Ctl().Volume();
+                [self scrollShellAt:video unit:kCGScrollEventUnitPixel delta:200 momentum:kCGMomentumScrollPhaseContinue];
+                vol[5] = mv->Ctl().Volume();
+                char what[240];
+                snprintf(what, sizeof what, "wheel = volume, 1 %% a notch: video %d, title strip %d, bar background %d, back %d (from 50)", vol[0], vol[1], vol[2], vol[3]);
+                check(vol[0] == 51 && vol[1] == 52 && vol[2] == 53 && vol[3] == 52, what);
+                snprintf(what, sizeof what, "trackpad: 24 + 24 DIP of travel = one notch (%d -> %d -> %d); momentum leaves it (%d)", vol[3], half, vol[4], vol[5]);
+                check(half == 52 && vol[4] == 53 && vol[5] == 53, what);
+                mv->Ctl().SetVolume(100);
+                next();
+            }];
+        }];
+    }];
+}
+
+/// #17 App::ChipsTick: the chips refresh every 2 s while playing, not while paused.
+- (void)parityChips:(ParityCheck)check next:(void (^)(void))next {
+    // past PREPARED's +0.5 s / +1.5 s refreshes
+    [self playLongClip:^{ [self after:1.6 run:^{ [self parityChipsPlaying:check next:next]; }]; }];
+}
+
+- (void)parityChipsPlaying:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    wvp::FfPlayer* player = mv->Player();
+    const int c0 = mv->ChipRefreshes();
+    [self after:4.3 run:^{
+        const int c1 = mv->ChipRefreshes();
+        player->Pause();
+        [self after:0.3 run:^{
+            const int c2 = mv->ChipRefreshes();
+            [self after:4.3 run:^{
+                const int c3 = mv->ChipRefreshes();
+                char what[200];
+                snprintf(what, sizeof what, "codec chips refresh every 2 s while playing (%d in 4.3 s) and not while paused (%d)", c1 - c0, c3 - c2);
+                check(c1 - c0 >= 2 && c1 - c0 <= 3 && c3 == c2, what);
+                player->Play();
+                [self waitFor:^bool { return player->State() == wvp::PlayerState::Playing; } seconds:3 then:^{ next(); }];
+            }];
+        }];
+    }];
+}
+
+/// #18 a right press on a playlist row makes the panel the keyboard target: Enter then plays that row.
+- (void)parityPanelTarget:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    app::ShellRoot* shell = mv->shell;
+    const NSRect frame = _window.frame;
+    if (!mv->PanelOpen()) [self key:0x61 chars:@""];   // F6
+    [self after:0.3 run:^{
+        app::PlaylistPanel* panel = shell->Panel();
+        panel->SetActive(false);
+        const pui::RectF row = panel->List()->RowRect(2);
+        [self->_shell rightMouseDown:[self mouseEvent:NSEventTypeRightMouseDown at:{row.cx(), row.cy()} clicks:1]];
+        [self->_shell rightMouseUp:[self mouseEvent:NSEventTypeRightMouseUp at:{row.cx(), row.cy()} clicks:1]];
+        const bool menu = mv->host.PopupCount() == 1;
+        check(panel->Visible() && panel->Active() && menu, "a right press on a playlist row opens its menu and makes the panel the key target");
+        [self key:53 chars:@"\x1b"];
+        check(mv->host.PopupCount() == 0 && panel->Active(), "Escape closes the row menu; the panel stays the key target");
+        [self key:36 chars:@"\r"];
+        [self waitFor:^bool { return [self playingIndex:2 past:0.3]; } seconds:10 then:^{
+            check(mv->Ctl().CurrentIndex() == 2, "Enter then plays the right-pressed row (not full screen)");
+            check(!mv->IsFullscreen(), "and does not toggle full screen");
+            [self->_window setFrame:frame display:YES];
+            next();
+        }];
+    }];
+}
+
+/// Menu-bar keys without a modifier (W , . /) type into the focused playlist search box; Cmd+C copies the frame.
+- (void)parityTypingAndCopy:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    app::ShellRoot* shell = mv->shell;
+    app::PlaylistPanel* panel = shell->Panel();
+    [self click:{panel->Search()->Bounds().cx(), panel->Search()->Bounds().cy()}];
+    const long long delay0 = (long long)mv->Player()->SubtitleDelay();
+    mv->ShowToast(L"self-test sentinel");
+    NSMutableArray<NSEvent*>* keys = [NSMutableArray array];
+    struct K { unsigned short code; NSString* chars; };
+    for (K k : {K{13, @"w"}, K{43, @","}, K{47, @"."}, K{44, @"/"}}) {
+        [keys addObject:[self keyEvent:NSEventTypeKeyDown code:k.code chars:k.chars mods:0 repeat:NO window:_window]];
+        [keys addObject:[self keyEvent:NSEventTypeKeyUp code:k.code chars:k.chars mods:0 repeat:NO window:_window]];
+    }
+    [self routeKeys:keys then:^(bool real) {
+        printf("     key routing: %s\n", real ? "AppKit's own (posted to the app's queue; the player is the key window of the active app)"
+                                              : "emulated (no key window in this session): bare keys to the first responder");
+        char what[260];
+        snprintf(what, sizeof what, "W , . / typed into the focused search box (\"%s\"), no subtitle command ran", wvp::ToUtf8(panel->Search()->Text()).c_str());
+        check(panel->Search()->Text() == L"w,./" && mv->LastToast() == L"self-test sentinel" && (long long)mv->Player()->SubtitleDelay() == delay0, what);
+        [self key:53 chars:@"\x1b"];
+        if (!panel->Search()->Text().empty()) [self key:53 chars:@"\x1b"];
+        mv->host.SetFocus(nullptr);
+        // Cmd+C without text focus: the frame with captions to the clipboard (a recorder instead of the pasteboard)
+        auto saved = mv->hooks.copyFrame;
+        auto copied = std::make_shared<int>(0);
+        mv->hooks.copyFrame = [copied](const wvp::BgraFrame& f) { if (f.Width > 0 && f.Height > 0) (*copied)++; };
+        auto finish = ^(bool realCopy) {
+            check(*copied == 1 && mv->LastToast() == app::Tr(L"Copied", L"복사됨"),
+                  realCopy ? "Cmd+C copies the frame (CaptureFrameWithCaptions), through AppKit's menu and responder chain"
+                           : "Cmd+C copies the frame (CaptureFrameWithCaptions): the Edit menu's Copy at the player's first responder");
+            mv->hooks.copyFrame = saved;
+            [self key:0x61 chars:@""];   // F6 closes the panel
+            [self after:0.3 run:^{ next(); }];
+        };
+        if (self->_window.isKeyWindow && NSApp.isActive) {
+            [self routeKeys:@[[self keyEvent:NSEventTypeKeyDown code:8 chars:@"c" mods:NSEventModifierFlagCommand repeat:NO window:self->_window],
+                              [self keyEvent:NSEventTypeKeyUp code:8 chars:@"c" mods:NSEventModifierFlagCommand repeat:NO window:self->_window]]
+                       then:^(bool) { finish(true); }];
+            return;
+        }
+        // no key window: AppKit has no target for the menu's copy: here, so the item is sent where it would go
+        NSMenuItem* copyItem = nil;
+        for (NSMenuItem* top in NSApp.mainMenu.itemArray)
+            for (NSMenuItem* it in MenuItems(top.submenu))
+                if (it.action == @selector(copy:) && [it.keyEquivalent isEqualToString:@"c"]) copyItem = it;
+        if (copyItem) [NSApp sendAction:copyItem.action to:self->_window.firstResponder from:copyItem];
+        finish(false);
+    }];
+}
+
+/// #8 hiding the docked panel never shrinks the window below its minimum width; #11/#12 a zoomed window keeps its frame
+/// for F6 and for the open-time 100 % sizing (the video resizes instead).
+- (void)parityPanelResize:(ParityCheck)check next:(void (^)(void))next {
+    [self playLongClip:^{ [self parityPanelResizePlaying:check next:next]; }];   // Next below must not race a clip's end
+}
+
+- (void)parityPanelResizePlaying:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    const NSRect saved = _window.frame;
+    if (mv->PanelOpen()) [self key:0x61 chars:@""];
+    NSRect f = _window.frame;
+    f.size.width = 560;
+    [_window setFrame:f display:YES];
+    [self key:0x61 chars:@""];   // F6: the panel docks, the window grows
+    [self after:0.3 run:^{
+        NSRect g = self->_window.frame;
+        g.size.width = 560;   // narrowed by hand with the panel still docked
+        [self->_window setFrame:g display:YES];
+        const bool docked = mv->PanelOpen() && mv->shell->Panel()->Visible() && !mv->Layout().panelOverlay;
+        [self key:0x61 chars:@""];   // F6: hide it
+        [self after:0.3 run:^{
+            char what[200];
+            snprintf(what, sizeof what, "hiding the docked panel in a 560 pt window leaves %.0f pt (minimum %.0f)", NSWidth(self->_window.frame), self->_window.minSize.width);
+            check(docked && !mv->PanelOpen() && NSWidth(self->_window.frame) == self->_window.minSize.width, what);
+            // zoom from a frame well inside the screen (zoom: on a frame that already fills it would restore instead)
+            const NSRect vis = self->_window.screen.visibleFrame;
+            [self->_window setFrame:NSMakeRect(NSMinX(vis) + 40, NSMinY(vis) + 40, 800, 520) display:YES];
+            [self->_window zoom:nil];
+            [self waitFor:^bool { return self->_window.zoomed; } seconds:3 then:^{
+                if (!self->_window.zoomed) { check(false, "the window zooms (performZoom)"); next(); return; }
+                const NSRect z = self->_window.frame;
+                const int videoW = mv->Layout().video.w();
+                [self key:0x61 chars:@""];
+                [self after:0.3 run:^{
+                    check(mv->PanelOpen() && NSEqualRects(self->_window.frame, z) && self->_window.zoomed && mv->Layout().video.w() < videoW,
+                          "zoomed: F6 docks the panel in the same frame, the video narrows");
+                    [self key:0x61 chars:@""];
+                    [self after:0.3 run:^{
+                        check(!mv->PanelOpen() && NSEqualRects(self->_window.frame, z) && mv->Layout().video.w() == videoW,
+                              "zoomed: F6 again hides it, frame unchanged, the video widens back");
+                        const int idx = mv->Ctl().CurrentIndex();
+                        mv->Execute(app::CommandId::Next);
+                        [self waitFor:^bool { return [self playingIndex:(idx + 1) % 4 past:0.8]; } seconds:10 then:^{
+                            check(self->_window.zoomed && NSEqualRects(self->_window.frame, z),
+                                  "zoomed: an opened video does not size the window to 100 % (it stays zoomed)");
+                            [self->_window zoom:nil];
+                            [self waitFor:^bool { return !self->_window.zoomed; } seconds:3 then:^{
+                                [self->_window setFrame:saved display:YES];
+                                next();
+                            }];
+                        }];
+                    }];
+                }];
+            }];
+        }];
+    }];
+}
+
+/// #21 App::ShowToast: 40 high, the text + 40 wide, centred, 16 DIP above the bar's rect, in full screen too.
+- (void)parityToast:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    auto placed = [mv]() {
+        const pui::RectF b = mv->ToastBounds(), bar = mv->Layout().bar;
+        return std::fabs(b.h() - 40) < 0.01f && std::fabs(b.b - (bar.t - 16)) < 0.6f && std::fabs(b.cx() - mv->host.Size().w / 2) < 1.f;
+    };
+    mv->ShowToast(L"Always on top: Off");
+    check(placed(), "toast: 40 DIP high, centred, 16 DIP above the docked bar");
+    const bool wasFs = mv->IsFullscreen();
+    if (!wasFs) mv->SetFullscreenState(true);
+    mv->ShowToast(L"Always on top: Off");
+    char what[200];
+    snprintf(what, sizeof what, "full screen: the toast sits 16 DIP above the bar zone (bottom %.0f, bar top %.0f), shown or not", mv->ToastBounds().b, mv->Layout().bar.t);
+    check(mv->IsFullscreen() && placed(), what);
+    if (!wasFs) mv->SetFullscreenState(false);
+    next();
+}
+
+/// #3 full screen: the cursor hides after 2 s without a move over the video, comes back on a move, stays over the bar.
+- (void)parityCursor:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    auto saved = mv->hooks.cursorAt;
+    auto at = std::make_shared<std::optional<pui::PointF>>();
+    mv->hooks.cursorAt = [at] { return *at; };   // the pointer over the player (the real one is not the test's)
+    mv->SetFullscreenState(true);
+    const pui::SizeF sz = mv->host.Size();
+    *at = pui::PointF{sz.w / 2, sz.h / 2};
+    mv->PointerAt(*at);
+    [self after:1.5 run:^{
+        const bool early = mv->CursorHidden();
+        [self after:0.9 run:^{
+            check(!early && mv->CursorHidden(), "full screen: the cursor is still shown after 1.5 s, hidden after 2 s without a move");
+            *at = pui::PointF{sz.w / 2 + 10, sz.h / 2};
+            mv->PointerAt(*at);
+            check(!mv->CursorHidden(), "a pointer move shows it at once");
+            [self after:2.4 run:^{
+                const bool hiddenAgain = mv->CursorHidden();
+                *at = pui::PointF{sz.w / 2 + 20, sz.h / 2};   // a move AppKit did not report to the shell (a drag): the tick sees it
+                [self after:0.3 run:^{
+                    check(hiddenAgain && !mv->CursorHidden(), "hidden again after 2 s; a polled position change shows it");
+                    *at = pui::PointF{sz.w / 2, sz.h - 10};
+                    mv->PointerAt(*at);   // the bottom edge: the bar shows
+                    [self after:2.4 run:^{
+                        check(mv->shell->Bar()->Visible() && !mv->CursorHidden(), "over the revealed bar it stays shown");
+                        *at = pui::PointF{sz.w / 2, sz.h / 2};
+                        mv->PointerAt(*at);
+                        [self after:2.4 run:^{
+                            const bool hidden = mv->CursorHidden();
+                            mv->SetFullscreenState(false);
+                            check(hidden && !mv->CursorHidden(), "leaving full screen shows it");
+                            [self after:2.3 run:^{
+                                check(!mv->CursorHidden(), "in a window it never hides");
+                                mv->hooks.cursorAt = saved;
+                                next();
+                            }];
+                        }];
+                    }];
+                }];
+            }];
+        }];
+    }];
+}
+
+/// #9 the mini bar auto-hides after 3 s idle (500 ms slide + fade), a pointer move / the wheel bring it back, keys do not;
+/// #10 hover arrives while the window is not key; #13 the mini player's resize aspect is the media's.
+- (void)parityMiniPlayer:(ParityCheck)check next:(void (^)(void))next {
+    [self playLongClip:^{ [self parityMiniPlayerPlaying:check next:next]; }];
+}
+
+- (void)parityMiniPlayerPlaying:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    app::ShellRoot* shell = mv->shell;
+    const wvp::WindowPlacement savedMini = mv->Svc().settings.miniWindow;
+    // a square saved mini rect: the aspect must come from the media (16:9 clips), not from the rect
+    NSRect vis = _window.screen.visibleFrame;
+    const CGFloat top = NSMaxY(NSScreen.screens.firstObject.frame);
+    const int l = (int)NSMinX(vis) + 40, t = (int)(top - NSMaxY(vis)) + 40;
+    mv->Svc().settings.miniWindow = app::MiniMakePlacement({l, t, l + 360, t + 360}, 1.f);
+    mv->Execute(app::CommandId::ToggleMiniPlayer);
+    [self after:0.5 run:^{
+        const NSSize ar = self->_window.contentAspectRatio;
+        char what[220];
+        snprintf(what, sizeof what, "mini player: resizing keeps the media's aspect %.3f (contentAspectRatio %.3f) in a %.0fx%.0f window",
+                 mv->MediaAspect(), ar.height > 0 ? ar.width / ar.height : 0, NSWidth(self->_window.frame), NSHeight(self->_window.frame));
+        check(mv->IsMiniPlayer() && std::fabs(mv->MediaAspect() - 16.0 / 9.0) < 0.01 && ar.height > 0 && std::fabs(ar.width / ar.height - mv->MediaAspect()) < 0.01, what);
+        NSTrackingAreaOptions opts = 0;
+        for (NSTrackingArea* a in self->_shell.trackingAreas) opts |= a.options;
+        check((opts & NSTrackingActiveAlways) && !(opts & NSTrackingActiveInKeyWindow), "the player's hover tracking is active whether or not it is key (NSTrackingActiveAlways)");
+        const pui::SizeF sz = mv->host.Size();
+        const bool key = self->_window.isKeyWindow;
+        [self moveTo:{sz.w / 2, sz.h / 2}];
+        [self after:0.4 run:^{
+            check(shell->Mini()->Visible() && mv->MiniBarHidden() == 0.f,
+                  key ? "a pointer move shows the mini bar" : "a pointer move shows the mini bar while the window is not key");
+            const CFAbsoluteTime moved = CFAbsoluteTimeGetCurrent() - 0.4;
+            [self waitFor:^bool { return mv->MiniBarHidden() > 0.f; } seconds:4 then:^{
+                const double idle = CFAbsoluteTimeGetCurrent() - moved;
+                [self after:0.25 run:^{
+                    const float p = mv->MiniBarHidden();
+                    const float slid = shell->Mini()->Bounds().t - mv->Layout().bar.t;
+                    char what2[220];
+                    snprintf(what2, sizeof what2, "playing, no move: the hide starts after %.2f s idle; 250 ms in it is %.0f %% hidden, %.1f DIP down",
+                             idle, p * 100, slid);
+                    check(idle >= 2.9 && idle < 3.5 && p > 0.05f && p < 0.95f && slid > 1 && slid < app::kBarSlideDip && mv->MiniBarAnimating(), what2);
+                    // the progress reaches 1 at the end time; the bar is taken away by the next animation frame
+                    [self waitFor:^bool { return mv->MiniBarHidden() == 1.f && !shell->Mini()->Visible(); } seconds:1 then:^{
+                        const double took = CFAbsoluteTimeGetCurrent() - moved - idle;
+                        char what3[200];
+                        snprintf(what3, sizeof what3, "it is gone %.2f s after it started (500 ms ease-in) and takes no clicks", took);
+                        pui::Widget* play = shell->Mini()->PlayButton();
+                        const pui::PointF pc{play->Bounds().cx(), play->Bounds().cy() - app::kBarSlideDip};
+                        check(mv->MiniBarHidden() == 1.f && !shell->Mini()->Visible() && took < 0.9 &&
+                              mv->host.HitTest(pc) != play, what3);
+                        [self key:46 chars:@"m"];   // M: mute, twice
+                        [self key:46 chars:@"m"];
+                        [self after:0.4 run:^{
+                            check(mv->MiniBarHidden() == 1.f, "keys do not bring it back");
+                            [self scrollShellAt:{sz.w / 2, sz.h / 2} unit:kCGScrollEventUnitLine delta:1 momentum:kCGMomentumScrollPhaseNone];
+                            [self scrollShellAt:{sz.w / 2, sz.h / 2} unit:kCGScrollEventUnitLine delta:-1 momentum:kCGMomentumScrollPhaseNone];
+                            [self after:0.4 run:^{
+                                check(mv->MiniBarHidden() == 0.f && shell->Mini()->Visible(), "the wheel brings it back (300 ms)");
+                                mv->Execute(app::CommandId::ToggleMiniPlayer);
+                                mv->Svc().settings.miniWindow = savedMini;
+                                [self after:0.5 run:^{ next(); }];
+                            }];
+                        }];
+                    }];
+                }];
+            }];
+        }];
+    }];
+}
+
+/// #5 Esc in the Settings window closes an open flyout first, then the window; #16 Edit filters closes Settings and opens
+/// the filters panel in the player.
+- (void)paritySettingsKeys:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    [self openSettings];
+    NSWindow* sw = (__bridge NSWindow*)_settings->Window();
+    NSView* pv = sw.contentView.subviews.firstObject;
+    auto* licenses = dynamic_cast<pui::Button*>(FindById(_settings->Page(), L"OpenSourceLicensesButton"));
+    if (licenses && licenses->onClick) licenses->onClick();
+    const bool dialog = _settings->Ui().PopupCount() == 1;
+    [pv keyDown:[self keyEvent:NSEventTypeKeyDown code:53 chars:@"\x1b" mods:0 repeat:NO window:sw]];
+    check(dialog && _settings->Ui().PopupCount() == 0 && _settings->IsOpen(), "Settings: Esc closes the open licenses dialog first, the window stays");
+    [pv keyDown:[self keyEvent:NSEventTypeKeyDown code:53 chars:@"\x1b" mods:0 repeat:NO window:sw]];
+    check(!_settings->IsOpen(), "Settings: Esc then closes the window");
+    [self openSettings];
+    auto* edit = dynamic_cast<pui::Button*>(FindById(_settings->Page(), L"EditFiltersButton"));
+    if (edit && edit->onClick) edit->onClick();
+    [self waitFor:^bool { return !self->_settings->IsOpen() && app::IsFiltersPanelOpen(*mv); } seconds:2 then:^{
+        check(edit && !self->_settings->IsOpen() && app::IsFiltersPanelOpen(*mv), "Settings > Edit filters closes Settings and opens the filters panel in the player");
+        mv->Execute(app::CommandId::Escape);
+        next();
+    }];
+}
+
+/// The always-on-top band (App::ApplyWindowTopmost, SettingsWindow's z-order, MiniPlayer, owned dialogs): every mode, a
+/// press on the player, a focus cycle, a state change while Settings is open, the mini player, a minimized player, an alert.
+- (void)parityTopmost:(ParityCheck)check next:(void (^)(void))next {
+    [self playLongClip:^{ [self parityTopmostPlaying:check next:next]; }];
+}
+
+- (void)parityTopmostPlaying:(ParityCheck)check next:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    wvp::FfPlayer* player = mv->Player();
+    const wvp::AlwaysOnTop savedMode = mv->Svc().settings.alwaysOnTop;
+    auto setMode = [mv](wvp::AlwaysOnTop m) { mv->Svc().settings.alwaysOnTop = m; app::OnSettingsChanged(*mv); };
+    using M = wvp::AlwaysOnTop;
+    const NSWindowLevel F = NSFloatingWindowLevel, N = NSNormalWindowLevel;
+    check((_window.collectionBehavior & NSWindowCollectionBehaviorManaged) && !(_window.collectionBehavior & NSWindowCollectionBehaviorTransient),
+          "the player stays a managed window (its Space, Mission Control, full screen) at the floating level");
+    // the four modes x playing / paused x windowed / full screen (ShouldBeTopmost), as the player's level
+    bool levels = true;
+    for (M m : {M::Disable, M::Enable, M::WhenPlaying, M::WhenFullscreen})
+        for (bool fs : {false, true}) {
+            setMode(m);
+            if (fs) mv->SetFullscreenState(true);
+            const bool want = app::sl::ShouldBeTopmost(m, player->State() == wvp::PlayerState::Playing, fs);
+            if (_window.level != (want ? F : N)) { levels = false; printf("     mode %d fs %d: level %ld\n", (int)m, fs, (long)_window.level); }
+            if (fs) mv->SetFullscreenState(false);
+        }
+    check(levels && player->State() == wvp::PlayerState::Playing, "playing: the player's level follows each Always on top mode in a window and in full screen");
+    setMode(M::Enable);
+    [self openSettings];
+    NSWindow* sw = (__bridge NSWindow*)_settings->Window();
+    check((sw.collectionBehavior & NSWindowCollectionBehaviorManaged) && (sw.collectionBehavior & NSWindowCollectionBehaviorFullScreenAuxiliary),
+          "Settings is managed and may join the player's full-screen Space");
+    const bool opened = [self window:sw inFrontOf:_window];
+    char what[240];
+    snprintf(what, sizeof what, "always on top: Settings opens in the player's band (level %ld / %ld), in front of it (z %ld < %ld)",
+             (long)sw.level, (long)_window.level, (long)[self zIndexOf:sw], (long)[self zIndexOf:_window]);
+    check(sw.level == F && _window.level == F && opened, what);
+    // a press on the player (a middle button, posted to this app's own queue: the local monitor sees it as AppKit would)
+    const pui::RectF b = mv->shell->Bar()->Bounds();
+    for (NSEventType type : {NSEventTypeOtherMouseDown, NSEventTypeOtherMouseUp})
+        [NSApp postEvent:[self windowEvent:type at:{b.l + 4, b.b - 3}] atStart:NO];
+    [self waitFor:^bool { return self->_settings->PlayerInFront(); } seconds:2 then:^{
+        const bool playerFront = [self window:self->_window inFrontOf:sw];
+        char what2[200];
+        snprintf(what2, sizeof what2, "a press on the player: Settings leaves the band (level %ld), the player is in front (z %ld < %ld)",
+                 (long)sw.level, (long)[self zIndexOf:self->_window], (long)[self zIndexOf:sw]);
+        check(self->_settings->PlayerInFront() && sw.level == N && playerFront, what2);
+        mv->ApplyWindowTopmost();
+        check(sw.level == N, "re-applying always on top does not lift Settings over the pressed player");
+        [self applicationDidBecomeActive:[NSNotification notificationWithName:NSApplicationDidBecomeActiveNotification object:NSApp]];
+        const bool settingsFront = [self window:sw inFrontOf:self->_window];
+        char what3[220];
+        snprintf(what3, sizeof what3, "the app activated from another app (a focus cycle): Settings is above the player again, in its band (level %ld, z %ld < %ld)",
+                 (long)sw.level, (long)[self zIndexOf:sw], (long)[self zIndexOf:self->_window]);
+        check(!self->_settings->PlayerInFront() && sw.level == F && settingsFront, what3);
+        setMode(M::WhenPlaying);
+        player->Pause();
+        [self waitFor:^bool { return player->State() == wvp::PlayerState::Paused; } seconds:3 then:^{
+            check(self->_window.level == N && sw.level == N && [self window:sw inFrontOf:self->_window],
+                  "While playing + pause: the player leaves the band and Settings follows, still in front");
+            player->Play();
+            [self waitFor:^bool { return player->State() == wvp::PlayerState::Playing; } seconds:3 then:^{
+                check(self->_window.level == F && sw.level == F && [self window:sw inFrontOf:self->_window],
+                      "playing again: both back in the band, Settings in front");
+                setMode(M::Disable);
+                check(self->_window.level == N && sw.level == N && [self window:sw inFrontOf:self->_window], "Off: both normal, Settings in front");
+                mv->Execute(app::CommandId::ToggleMiniPlayer);
+                [self after:0.5 run:^{
+                    check(mv->IsMiniPlayer() && self->_window.level == F && [self window:self->_window inFrontOf:sw],
+                          "the mini player floats at the top of the band, over Settings (HWND_TOPMOST)");
+                    mv->Execute(app::CommandId::ToggleMiniPlayer);
+                    [self after:0.5 run:^{
+                        check(!mv->IsMiniPlayer() && self->_window.level == N && sw.level == N && [self window:sw inFrontOf:self->_window],
+                              "leaving it re-applies Off and puts Settings back above the player");
+                        [self parityMinimized:check settings:sw then:^{ [self parityAlertLevel:check then:^{
+                            setMode(savedMode);
+                            self->_settings->Close();
+                            next();
+                        }]; }];
+                    }];
+                }];
+            }];
+        }];
+    }];
+}
+
+- (void)parityMinimized:(ParityCheck)check settings:(NSWindow*)sw then:(void (^)(void))next {
+    [_window miniaturize:nil];
+    [self waitFor:^bool { return self->_window.miniaturized; } seconds:3 then:^{
+        const bool real = self->_window.miniaturized;
+        if (!real) {   // no Dock animation in this session: the delegate calls AppKit would make
+            printf("     minimize: emulated (the window server did not minimize the window in this session)\n");
+            [self windowDidMiniaturize:[NSNotification notificationWithName:NSWindowDidMiniaturizeNotification object:self->_window]];
+        }
+        check(!sw.visible && self->_settings->IsOpen(), "the player minimized: Settings is hidden, still open");
+        if (real) [self->_window deminiaturize:nil];
+        else [self windowDidDeminiaturize:[NSNotification notificationWithName:NSWindowDidDeminiaturizeNotification object:self->_window]];
+        [self waitFor:^bool { return !self->_window.miniaturized && sw.visible; } seconds:3 then:^{
+            check(sw.visible && !sw.isKeyWindow && sw.level == self->_window.level && [self window:sw inFrontOf:self->_window],
+                  "restored: Settings shows again above the player, not activated");
+            next();
+        }];
+    }];
+}
+
+- (void)parityAlertLevel:(ParityCheck)check then:(void (^)(void))next {
+    mainview::MainView* mv = _mv.get();
+    mv->Svc().settings.alwaysOnTop = wvp::AlwaysOnTop::Enable;
+    app::OnSettingsChanged(*mv);
+    NSAlert* alert = [[NSAlert alloc] init];
+    alert.messageText = @"ARIB Player self-test";
+    app::RaiseDialogToOwner((__bridge void*)alert.window, (__bridge void*)_window);   // as PromptText / PickPaths do
+    __block NSWindowLevel level = -1;
+    __block NSInteger z = -1, zp = -1;
+    NSTimer* t = [NSTimer timerWithTimeInterval:0.3 repeats:NO block:^(NSTimer*) {
+        level = alert.window.level;
+        z = [self zIndexOf:alert.window];
+        zp = [self zIndexOf:self->_window];
+        [NSApp abortModal];
+    }];
+    [NSRunLoop.currentRunLoop addTimer:t forMode:NSModalPanelRunLoopMode];
+    [alert runModal];
+    char what[200];
+    snprintf(what, sizeof what, "an owned modal dialog (runModal after RaiseDialogToOwner) is in front of an always-on-top player (level %ld >= %ld, z %ld < %ld)",
+             (long)level, (long)_window.level, (long)z, (long)zp);
+    check(level >= _window.level && z < zp, what);
+    next();
 }
 
 // --- the two-launch persistence test -----------------------------------------------------------------------------------
