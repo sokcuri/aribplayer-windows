@@ -84,7 +84,9 @@ public:
     void SetFullscreenState(bool on);   // the NSWindow entered / left full screen
     /// Periodic (10 Hz): position / duration of the player into the bar model.
     void Tick();
-    /// Full screen / mini player reveal: the pointer moved to a client DIP (or left the window: nullopt).
+    /// Full screen / mini player reveal: the pointer moved to a client DIP (or left the window: nullopt). Full screen:
+    /// the title strip (top kStripDip), the bar (bottom kDockDip) and the playlist panel (right kEdgeRightDip) each show
+    /// while the pointer is in its edge zone or over its rect (App::UpdateEdgeReveal).
     void PointerAt(std::optional<pui::PointF> p);
     /// Key routing like App: open popup / focused search box -> active playlist panel -> global key table (held-key
     /// stepping for frame / keyframe / timed seeks as App::RunKeyCommand).
@@ -94,7 +96,9 @@ public:
     void VideoWheel(float notches);
     void ShowMainMenu(pui::PointF at);
     void ShowMainMenu(pui::Widget* anchor);
-    /// A press landed on the shell: the playlist panel is active while the user clicks inside it.
+    /// App::NotePointerTarget: a press inside a playlist panel (docked or overlay) makes it the key target, a press on the
+    /// video / bar / title deactivates them; a press in another popup (a menu opened from the panel) leaves them alone. A
+    /// press anywhere but the search box ends text entry.
     void PressAt(pui::Widget* hit);
     bool IsTitleStripPoint(pui::PointF p) const;   // empty strip area (window drag)
     bool IsVideoPoint(pui::PointF p) const;
@@ -106,6 +110,9 @@ public:
     bool DropAt(pui::PointF dip, const std::vector<std::wstring>& paths);
     const std::wstring& Title() const { return model_.title; }
     bool PanelOpen() const { return svc_.settings.playlistPanel; }
+    /// The overlay playlist panel (App::panelPopup_): the full-screen right-edge panel or, in a window too narrow to dock
+    /// it, the toggle's light-dismiss popup over the video; nullptr while closed.
+    app::PlaylistPanel* PanelPopup() const { return panelPopup_; }
     std::uint32_t Accent() const { return accent_; }
 
     // --- AppContext ---
@@ -185,6 +192,18 @@ private:
     void ApplyMode();
     void SyncModel();
     void TogglePlaylistPanel();
+    void FocusPlaylistSearch();
+    /// App::OpenPanelOverlay: the playlist panel as a light-dismiss popup at the stored width (min(width, W - 16)) over
+    /// the video's right side; full screen: the full-height column at the right edge with square corners, not active.
+    void OpenPanelOverlay();
+    void ForPanels(const std::function<void(app::PlaylistPanel&)>& f);
+    /// App::SelectionPanel: the panel whose selection Play starts (the overlay one, else the docked one).
+    app::PlaylistPanel* SelectionPanel() const;
+    /// App::NonPanelPopups: user popups other than the full-screen edge panel (the Mac menus are popups of this host).
+    size_t NonPanelPopups() const;
+    /// App::PanelInteractionActive: the edge panel stays while the pointer is over it, a menu / popup is open, a
+    /// press inside it holds the capture, or the search box has the keyboard.
+    bool PanelInteractionActive() const;
     void UpdateOverlays();
     void RefreshChips();
     void TogglePause();
@@ -231,6 +250,7 @@ private:
     pui::ThemeMode themeMode_ = pui::ThemeMode::System;
     std::uint32_t accent_ = 0;
     std::optional<pui::PointF> pointer_;
+    app::PlaylistPanel* panelPopup_ = nullptr;   // owned by the host's popup stack
     std::set<int> heldKeys_;
     wvp::FrameStepController frameStep_{MakeFrameStepHooks()};
     Toast* toast_ = nullptr;

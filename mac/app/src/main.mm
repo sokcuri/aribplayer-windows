@@ -878,6 +878,114 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
     return s ? std::string(s.UTF8String) : std::string();
 }
 
+/// Alpha (0..255) of the top-left device pixel of `w` painted alone (PaintTree into a transparent bitmap with the
+/// flipped point -> pixel CTM ShellView's drawRect: gets): a square-cornered surface paints it, a rounded one leaves it clear.
+- (int)topLeftAlpha:(pui::Widget*)w {
+    const CGFloat s = _window.backingScaleFactor;
+    const pui::RectF b = w->Bounds();
+    const size_t px = (size_t)std::lround(8 * s);
+    std::vector<uint8_t> buf(px * px * 4, 0);
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(buf.data(), px, px, 8, px * 4, cs, kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return -1;
+    CGContextTranslateCTM(ctx, 0, (CGFloat)px);
+    CGContextScaleCTM(ctx, s, -s);
+    CGContextTranslateCTM(ctx, -b.l, -b.t);
+    _renderer->Begin(ctx, (float)s);
+    w->PaintTree(*_renderer, _mv->host.GetTheme());
+    _renderer->End();
+    CGContextRelease(ctx);
+    return buf[3];   // row 0 of the bitmap is its top
+}
+
+/// Full screen: the playlist panel at the right edge (docs/main-window-ui-notes.md, layout table row "Full screen" and
+/// "Full screen edge reveal"): revealed by the right kEdgeRightDip band as the overlay popup (full height, the stored
+/// width, square corners), kept while the pointer is over it, a menu from it is open or its search box has focus, closed
+/// at once otherwise; the toggle stays disabled. Pointer moves are synthesised NSEvents through ShellView.
+- (void)edgePanelTests:(void (^)(bool, const char*))check next:(void (^)(void))done {
+    mainview::MainView* mv = _mv.get();
+    app::ShellRoot* shell = mv->shell;
+    auto centre = [](pui::Widget* w) { return pui::PointF{w->Bounds().cx(), w->Bounds().cy()}; };
+    const pui::SizeF S = mv->host.Size();
+    const pui::PointF mid{S.w / 2, S.h / 2}, edge{S.w - 2, S.h / 2};
+    const bool wanted0 = mv->PanelOpen();
+    mv->host.CloseAllPopups();
+    [self moveTo:mid];
+    const bool noneMid = mv->PanelPopup() == nullptr;
+    [self moveTo:{S.w - app::kEdgeRightDip - 1, S.h / 2}];
+    check(noneMid && !mv->PanelPopup(), "full screen: no playlist panel over the video or just left of the right 12 DIP band");
+    mv->Svc().settings.playlistPanel = false;   // shown regardless of the windowed panel setting
+    [self moveTo:edge];
+    app::PlaylistPanel* p = mv->PanelPopup();
+    const float w = std::min((float)mv->Svc().settings.playlistPanelWidthDip, S.w - 16);
+    const pui::RectF b = p ? p->Bounds() : pui::RectF{};
+    char what[240];
+    snprintf(what, sizeof what, "the right 12 DIP band opens the overlay panel: full height at the right edge, the stored width "
+             "(%.0f..%.0f x %.0f..%.0f in %.0f x %.0f, stored %d DIP), with the panel setting off", b.l, b.r, b.t, b.b, S.w, S.h,
+             mv->Svc().settings.playlistPanelWidthDip);
+    check(p && mv->host.IsPopupOpen(p) && std::fabs(b.r - S.w) < 0.5f && std::fabs(b.t) < 0.5f && std::fabs(b.b - S.h) < 0.5f &&
+          std::fabs(b.w() - w) < 0.5f, what);
+    mv->Svc().settings.playlistPanel = wanted0;
+    const int alpha = p ? [self topLeftAlpha:p] : -1;
+    snprintf(what, sizeof what, "its corners are square (top-left pixel alpha %d)", alpha);
+    check(alpha >= 200, what);
+    check(p && !p->Active() && !shell->Bar()->Visible() && !shell->Title()->Visible(),
+          "it is not the key target until clicked into; the bar and the title strip stay hidden");
+    pui::Widget* toggle = shell->Bar()->ButtonWidget(app::B_Panel);
+    [self key:0x61 chars:@""];   // F6
+    check(!toggle->Enabled() && !shell->Bar()->Model().panelAvailable && mv->PanelOpen() == wanted0 && mv->PanelPopup() == p,
+          "the playlist toggle stays disabled (F6 changes nothing)");
+    [self moveTo:{b.l + 24, S.h / 3}];
+    check(mv->PanelPopup() == p, "it stays while the pointer is over its rect, off the edge band");
+    [self moveTo:mid];
+    check(!mv->PanelPopup(), "moving off it closes it at once");
+    // a menu from it (the + button) keeps it
+    [self moveTo:edge];
+    p = mv->PanelPopup();
+    if (!p) { check(false, "the edge band reopens it"); done(); return; }
+    [self click:centre(p->PlusButton())];
+    const bool menu = dynamic_cast<puimac::MenuPopup*>(mv->host.TopPopup()) != nullptr && app::nativemenu::IsOpen();
+    [self moveTo:mid];
+    check(menu && mv->PanelPopup() == p && mv->host.IsPopupOpen(p), "the panel's + menu is open: the panel stays with the pointer away");
+    [self key:53 chars:@"\x1b"];   // Escape closes the menu
+    [self waitFor:^bool { return !mv->PanelPopup(); } seconds:1 then:^{
+        check(!app::nativemenu::IsOpen() && !mv->PanelPopup(), "the menu closed with the pointer away: the panel hides at once");
+        // the search box keeps it
+        [self moveTo:edge];
+        app::PlaylistPanel* q = mv->PanelPopup();
+        if (!q) { check(false, "the edge band reopens it"); done(); return; }
+        [self click:centre(q->Search())];
+        check(pui::TextBox::IsTextInputFocused(mv->host) && mv->host.Focused() == q->Search() && q->Active(),
+              "a click into its search box focuses the box and makes the panel the key target");
+        [self moveTo:mid];
+        check(mv->PanelPopup() == q, "it stays while the search box has focus, with the pointer away");
+        [self key:53 chars:@"\x1b"];   // Esc on the empty box hands the keyboard back
+        [self waitFor:^bool { return !mv->PanelPopup(); } seconds:1 then:^{
+            check(!pui::TextBox::IsTextInputFocused(mv->host) && !mv->PanelPopup(), "Esc releases the search box: the panel hides at once");
+            [self moveTo:edge];
+            const bool again = mv->PanelPopup() != nullptr;
+            [self moveTo:{S.w / 2, S.h - 10}];
+            check(again && !mv->PanelPopup() && shell->Bar()->Visible(), "the bottom edge shows the bar and closes the panel");
+            // another menu (the video's main menu) open: the band opens no panel over it, then does once it closed
+            [self moveTo:mid];
+            [self->_shell rightMouseDown:[self mouseEvent:NSEventTypeRightMouseDown at:mid clicks:1]];
+            [self->_shell rightMouseUp:[self mouseEvent:NSEventTypeRightMouseUp at:mid clicks:1]];
+            const bool mainMenu = app::nativemenu::IsOpen();
+            [self moveTo:edge];
+            check(mainMenu && !mv->PanelPopup() && dynamic_cast<puimac::MenuPopup*>(mv->host.TopPopup()) != nullptr,
+                  "with the video's main menu open the right band opens no panel over it");
+            [self key:53 chars:@"\x1b"];   // Escape closes the menu
+            [self waitFor:^bool { return mv->PanelPopup() != nullptr; } seconds:1 then:^{
+                check(!app::nativemenu::IsOpen() && mv->PanelPopup() != nullptr, "once the menu closed, the pointer in the band opens it");
+                [self moveTo:mid];
+                check(!mv->PanelPopup(), "and moving off closes it");
+                done();
+            }];
+        }];
+    }];
+}
+
 /// The second half of the caption on / off step: caption visibility while paused (the engine redraws the held picture without / with
 /// the caption layer) and the main menu's Subtitles entries (Off / the caption track: track cycling).
 - (void)captionsPausedAndMenu:(void (^)(bool, const char*))check drawn:(long long (^)(void))drawn next:(void (^)(void))next {
@@ -2289,13 +2397,112 @@ struct AvSample { double avMs, audio, video, at; long long dropsLate; };
             const bool hiddenMid = !shell->Bar()->Visible() && !shell->Title()->Visible();
             mv->PointerAt(pui::PointF{mv->host.Size().w / 2, mv->host.Size().h - 10});
             check(mv->IsFullscreen() && hiddenMid && shell->Bar()->Visible(), "full screen: bar and title hidden over the video, the bar revealed at the bottom edge");
-            if (!appKit) { mv->SetFullscreenState(false); next(); return; }
-            [self key:53 chars:@"\x1b"];   // Escape
-            [self waitFor:^bool { return !mv->IsFullscreen() && !(self->_window.styleMask & NSWindowStyleMaskFullScreen); } seconds:5 then:^{
-                check(!mv->IsFullscreen() && !(self->_window.styleMask & NSWindowStyleMaskFullScreen), "Escape leaves full screen");
-                next();
+            printf("     edge playlist panel: %s\n", appKit ? "in AppKit full screen" : "in the shell's full-screen mode (no AppKit transition)");
+            auto restored = ^(const char* how) {
+                char what[200];
+                snprintf(what, sizeof what, "%s: no overlay panel, the docked panel follows the setting again (%s), the toggle is enabled",
+                         how, mv->PanelOpen() ? "on" : "off");
+                check(!mv->PanelPopup() && shell->Panel()->Visible() == (mv->PanelOpen() && !mv->Layout().panelOverlay) &&
+                      shell->Bar()->ButtonWidget(app::B_Panel)->Enabled() && shell->Bar()->Model().panelOpen == shell->Panel()->Visible(), what);
+            };
+            [self edgePanelTests:check next:^{
+                if (!appKit) { mv->SetFullscreenState(false); restored("leaving the full-screen mode"); next(); return; }
+                [self key:53 chars:@"\x1b"];   // Escape
+                [self waitFor:^bool { return !mv->IsFullscreen() && !(self->_window.styleMask & NSWindowStyleMaskFullScreen); } seconds:5 then:^{
+                    check(!mv->IsFullscreen() && !(self->_window.styleMask & NSWindowStyleMaskFullScreen), "Escape leaves full screen");
+                    restored("Escape left full screen");
+                    next();
+                }];
             }];
         }];
+    }];
+    // leaving full screen with the edge panel open restores the docked panel (the shell's full-screen mode: the same
+    //     MainView path AppKit's windowDidEnterFullScreen / windowDidExitFullScreen take, without the transition)
+    [steps addObject:^(void (^next)(void)) {
+        const bool wanted0 = mv->PanelOpen();
+        if (!wanted0) mv->Execute(app::CommandId::TogglePlaylistPanel);
+        [self after:0.3 run:^{
+            const bool docked = mv->PanelOpen() && shell->Panel()->Visible() && !mv->Layout().panelOverlay;
+            const int width0 = mv->Svc().settings.playlistPanelWidthDip;
+            mv->SetFullscreenState(true);
+            const pui::SizeF S = mv->host.Size();
+            const bool dockedHidden = !shell->Panel()->Visible();
+            [self moveTo:{S.w - 2, S.h / 2}];
+            app::PlaylistPanel* p = mv->PanelPopup();
+            check(docked && dockedHidden && p && std::fabs(p->Bounds().w() - std::min((float)width0, S.w - 16)) < 0.5f,
+                  "panel docked, then full screen: the docked panel hides, the right edge opens the overlay one at the stored width");
+            mv->SetFullscreenState(false);
+            check(!mv->PanelPopup() && !mv->host.IsPopupOpen(p) && mv->PanelOpen() && shell->Panel()->Visible() && !mv->Layout().panelOverlay &&
+                  shell->Bar()->ButtonWidget(app::B_Panel)->Enabled() && shell->Bar()->Model().panelOpen &&
+                  mv->Svc().settings.playlistPanelWidthDip == width0,
+                  "leaving full screen with the edge panel open: it closes, the docked panel is back (setting and width unchanged), the toggle is pressed");
+            [self moveTo:{mv->host.Size().w / 2, mv->host.Size().h / 2}];
+            if (!wanted0) mv->Execute(app::CommandId::TogglePlaylistPanel);
+            [self after:0.3 run:^{ next(); }];
+        }];
+    }];
+    // a window too narrow to dock the panel (row < 488 DIP, ShellLayout::panelOverlay): the toggle opens it as a
+    //     light-dismiss popup over the video's right side (docs/main-window-ui-notes.md: layout table, "narrow window: popup mode")
+    [steps addObject:^(void (^next)(void)) {
+        const NSRect frame0 = self->_window.frame;
+        const bool wanted0 = mv->PanelOpen();
+        mv->Svc().settings.playlistPanel = true;
+        mv->Svc().settingsStore.Save(mv->Svc().settings);
+        NSRect f = frame0;
+        f.size.width = self->_window.minSize.width;
+        [self->_window setFrame:f display:YES];
+        [self->_shell relayout];
+        pui::Widget* toggle = shell->Bar()->ButtonWidget(app::B_Panel);
+        check(mv->Layout().panelOverlay && !shell->Panel()->Visible() && !mv->PanelPopup() && toggle->Enabled() && toggle->Visible() &&
+              !shell->Bar()->Model().panelOpen,
+              "a 500 pt window cannot dock the wanted panel: it is hidden and the enabled toggle is not pressed");
+        [self click:centre(toggle)];
+        app::PlaylistPanel* p = mv->PanelPopup();
+        const app::RectPx& v = mv->Layout().video;
+        const float s = mv->Scale(), w = std::min((float)mv->Svc().settings.playlistPanelWidthDip, mv->host.Size().w - 16);
+        const pui::RectF b = p ? p->Bounds() : pui::RectF{};
+        char what[240];
+        snprintf(what, sizeof what, "the toggle opens it over the video's right side at the stored width (%.0f..%.0f x %.0f..%.0f, video %.0f..%.0f x %.0f..%.0f)",
+                 b.l, b.r, b.t, b.b, v.l / s, v.r / s, v.t / s, v.b / s);
+        check(p && std::fabs(b.r - v.r / s) < 0.5f && std::fabs(b.t - v.t / s) < 0.5f && std::fabs(b.b - v.b / s) < 0.5f &&
+              std::fabs(b.w() - w) < 0.5f, what);
+        const int alpha = p ? [self topLeftAlpha:p] : -1;
+        snprintf(what, sizeof what, "with rounded corners (top-left pixel alpha %d)", alpha);
+        check(alpha >= 0 && alpha < 40, what);
+        check(p && p->Active() && shell->Bar()->Model().panelOpen && mv->PanelOpen(), "the toggle is pressed while it is open; it is the key target");
+        [self click:{v.l / s + 40, (v.t + v.b) / 2.f / s}];   // on the video
+        check(!mv->PanelPopup() && mv->PanelOpen() && !shell->Bar()->Model().panelOpen, "a click outside closes it (light dismiss) and keeps the setting");
+        const CGFloat narrowW = NSWidth(self->_window.frame);
+        [self key:0x61 chars:@""];   // F6
+        p = mv->PanelPopup();
+        check(p && mv->PanelOpen() && p->Bounds() == b && NSWidth(self->_window.frame) == narrowW,
+              "F6 opens the same popup (the window keeps its size)");
+        [self click:{v.l / s + 40, (v.t + v.b) / 2.f / s}];
+        auto cmdKey = [self](NSString* ch, unsigned short code, NSEventType type) {
+            return [NSEvent keyEventWithType:type location:NSZeroPoint modifierFlags:NSEventModifierFlagCommand timestamp:0
+                                windowNumber:self->_window.windowNumber context:nil characters:ch charactersIgnoringModifiers:ch isARepeat:NO keyCode:code];
+        };
+        [self->_shell keyDown:cmdKey(@"s", 1, NSEventTypeKeyDown)];   // ⌘S: the key table's Ctrl+S (FocusPlaylistSearch)
+        [self->_shell keyUp:cmdKey(@"s", 1, NSEventTypeKeyUp)];
+        p = mv->PanelPopup();
+        check(p && mv->host.Focused() == p->Search() && pui::TextBox::IsTextInputFocused(mv->host),
+              "⌘S (focus playlist search) opens it with the search box focused");
+        [self key:53 chars:@"\x1b"];   // Esc on the empty box: the keyboard goes back to the player, the popup stays
+        check(mv->PanelPopup() == p && !pui::TextBox::IsTextInputFocused(mv->host), "Esc on the empty box releases it; the popup stays");
+        [self click:{v.l / s + 40, (v.t + v.b) / 2.f / s}];
+        const BOOL cmdF = [NSApp.mainMenu performKeyEquivalent:cmdKey(@"f", 3, NSEventTypeKeyDown)];   // the menu bar's ⌘F
+        p = mv->PanelPopup();
+        check(cmdF && p && mv->host.Focused() == p->Search(), "⌘F through the menu bar opens it with the search box focused");
+        [self key:53 chars:@"\x1b"];
+        [self key:0x61 chars:@""];      // F6
+        check(!mv->PanelPopup() && !mv->PanelOpen() && !shell->Panel()->Visible() && NSWidth(self->_window.frame) == narrowW,
+              "F6 closes it and clears the setting (the window keeps its size)");
+        mv->Svc().settings.playlistPanel = wanted0;
+        mv->Svc().settingsStore.Save(mv->Svc().settings);
+        [self->_window setFrame:frame0 display:YES];
+        [self->_shell relayout];
+        check(NSEqualRects(self->_window.frame, frame0) && mv->PanelOpen() == wanted0 && !mv->PanelPopup(), "window and panel setting restored");
+        next();
     }];
     [steps addObject:^(void (^next)(void)) {
         (void)next;

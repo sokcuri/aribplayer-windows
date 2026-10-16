@@ -193,7 +193,9 @@ std::wstring ToW(NSString* s) {
         [self afterEvent];
         return;
     }
-    _mv->host.PointerMove([self pointerEvent:e button:pui::PointerButton::Left]);
+    pui::PointerEvent pe = [self pointerEvent:e button:pui::PointerButton::Left];
+    _mv->host.PointerMove(pe);
+    _mv->PointerAt(pe.pt);   // the full-screen reveal follows a drag too (the capture keeps what it started on)
     [self afterEvent];
 }
 

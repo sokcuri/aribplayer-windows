@@ -31,6 +31,7 @@
 #include "pui/InfoBar.h"
 #include "pui/TextBox.h"
 #include "pui/ToolTipStyle.h"
+#include "shell/PlaylistPanel.h"
 #include "puimac/CGRenderer.h"
 #include "puimac/MacTheme.h"
 #include "wvp/DebugInfo.h"
@@ -136,8 +137,11 @@ MainView::MainView(puimac::CGRenderer* measurer, void* videoView, const std::str
     toast_ = shell->Add<Toast>();
     debug_ = shell->Add<DebugOverlay>();   // above the shell widgets, below popups (Layer::DebugOverlay)
     app::nativemenu::SetMacHost(&host, measurer_);
-    // Player views hold no widget focus except the playlist search box; popups (menus, dialogs) focus normally.
+    // App::AllowsFocus: player views hold no widget focus except the playlist search box (of the docked or the overlay
+    // panel); other popups (menus, dialogs) focus normally.
     host.focusFilter = [this](const pui::Widget* w) {
+        for (const pui::Widget* p = w; p; p = p->Parent())
+            if (auto* panel = dynamic_cast<const app::PlaylistPanel*>(p)) return w == panel->Search();
         const pui::Widget* top = w;
         while (top && top->Parent()) top = top->Parent();
         return top != shell || dynamic_cast<const pui::TextBox*>(w) != nullptr;
@@ -219,7 +223,7 @@ MainView::MainView(puimac::CGRenderer* measurer, void* videoView, const std::str
         }
         shell->Title()->SetTitle(model_.title);
         OnMediaOpened.raise(it);
-        shell->Panel()->OnCurrentChanged();
+        ForPanels([](app::PlaylistPanel& p) { p.OnCurrentChanged(); });
         SyncModel();
     });
     ctl_->QueueChanged.add([this] {
@@ -227,7 +231,7 @@ MainView::MainView(puimac::CGRenderer* measurer, void* videoView, const std::str
         if (!suppressPlaylistPersistence_ && !PersistCurrentPlaylist())
             ShowInfoBar(app::InfoSeverity::Error, app::Tr(L"Could not save the current playlist", L"현재 재생목록을 저장할 수 없습니다"),
                         currentPlaylist_.empty() ? app::Tr(L"Unnamed playlist", L"이름 없는 재생목록") : wvp::ToWide(currentPlaylist_));
-        shell->Panel()->OnQueueChanged();
+        ForPanels([](app::PlaylistPanel& p) { p.OnQueueChanged(); });
         SyncModel();
     });
     ctl_->ModeChanged.add([this] { SyncModel(); });
@@ -438,26 +442,47 @@ void MainView::SetMiniPlayer(bool on) {
     OnModeChanged.raise(modes_.Mode());
 }
 
-/// Full screen: the title strip and the bar appear only while the cursor is in their edge zone / on them (App's edge
-/// mode: snap, no slide). Mini player: the reduced bar shows while the pointer is over the window. Windowed: both are
-/// docked and always shown.
+/// Full screen (App::UpdateEdgeReveal): the title strip, the bar and the playlist panel appear only while the cursor is
+/// in their edge zone / on their rect (App's edge mode: snap, no slide); a popup / menu, a seek drag (and for the panel
+/// its search box) keeps them. Mini player: the reduced bar shows while the pointer is over the window. Windowed: both
+/// are docked and always shown.
 void MainView::UpdateOverlays() {
-    const bool interacting = UserPopupOpen() || shell->Bar()->SeekDragging();
     if (modes_.mini) {
+        const bool interacting = UserPopupOpen() || shell->Bar()->SeekDragging();
         app::MiniBar* mini = shell->Mini();
         mini->SetVisible(pointer_.has_value() || interacting || state_ != wvp::PlayerState::Playing);
         return;
     }
     if (!modes_.fullscreen) return;
+    const bool interacting = NonPanelPopups() > 0 || shell->Bar()->SeekDragging();
     const pui::SizeF s = host.Size();
     bool top = false, bottom = false;
+    app::EdgeZones z;
     if (pointer_) {
-        app::EdgeZones z = app::EdgeZonesAt(pointer_->x, pointer_->y, s.w, s.h);
+        z = app::EdgeZonesAt(pointer_->x, pointer_->y, s.w, s.h);
         top = z.top || (shell->Title()->Visible() && shell->Title()->Bounds().Contains(*pointer_));
         bottom = z.bottom || (shell->Bar()->Visible() && shell->Bar()->Bounds().Contains(*pointer_));
     }
     shell->Title()->SetVisible(top || (interacting && shell->Title()->Visible()));
     shell->Bar()->SetVisible(bottom || (interacting && shell->Bar()->Visible()));
+    // The right band opens the edge panel. The Mac menus are popups of this host, so an open menu (Windows: a native
+    // menu, above every app window) keeps it closed rather than opening it over the menu.
+    if (z.right && !panelPopup_ && !host.Captured() && !app::nativemenu::IsOpen()) OpenPanelOverlay();
+    if (panelPopup_ && !PanelInteractionActive()) host.ClosePopup(panelPopup_);
+}
+
+size_t MainView::NonPanelPopups() const {
+    size_t n = host.PopupCount();
+    if (infoBar_ && host.IsPopupOpen(infoBar_) && n > 0) n--;   // the app's own notice (App::notices_)
+    if (panelPopup_ && modes_.fullscreen && n > 0) n--;
+    return n;
+}
+
+bool MainView::PanelInteractionActive() const {
+    if (!panelPopup_) return false;
+    if (NonPanelPopups() > 0 || pui::TextBox::IsTextInputFocused(host)) return true;
+    if (const pui::Widget* cp = host.Captured()) if (cp == panelPopup_ || panelPopup_->IsAncestorOf(cp)) return true;
+    return pointer_ && panelPopup_->Bounds().Contains(*pointer_);
 }
 
 void MainView::PointerAt(std::optional<pui::PointF> p) {
@@ -476,10 +501,13 @@ bool MainView::IsVideoPoint(pui::PointF p) const {
 }
 
 void MainView::PressAt(pui::Widget* hit) {
-    app::PlaylistPanel* panel = shell->Panel();
-    const bool inPanel = hit && panel->Visible() && (hit == panel || panel->IsAncestorOf(hit));
-    panel->SetActive(inPanel);
-    if (!inPanel && host.Focused() && host.Focused() == panel->Search()) host.SetFocus(nullptr);
+    const app::PlaylistPanel* hitPanel = nullptr;
+    for (const pui::Widget* p = hit; p && !hitPanel; p = p->Parent()) hitPanel = dynamic_cast<const app::PlaylistPanel*>(p);
+    if (pui::TextBox::IsTextInputFocused(host) && (!hitPanel || hit != hitPanel->Search())) {
+        if (const pui::Widget* f = host.Focused(); f && dynamic_cast<const app::PlaylistPanel*>(f->Parent())) host.SetFocus(nullptr);
+    }
+    if (hitPanel) ForPanels([&](app::PlaylistPanel& p) { p.SetActive(&p == hitPanel); });
+    else if (!hit || hit == shell || shell->IsAncestorOf(hit)) ForPanels([](app::PlaylistPanel& p) { p.SetActive(false); });
 }
 
 /// App::RouteDropAtClient.
@@ -518,7 +546,7 @@ void MainView::Tick() {
         infoBar_ = nullptr;
     }
     engine_->Poll(now);
-    if (modes_.mini) UpdateOverlays();
+    if (modes_.mini || modes_.fullscreen) UpdateOverlays();   // App::AutoHideTick: a closed menu / released drag hides at once
     if (debugVisible_ && now >= debugNextMs_) {   // ~4 Hz while shown, nothing while hidden (App::Tick)
         debugNextMs_ = now + 250;
         RefreshDebugOverlay();
@@ -539,7 +567,7 @@ void MainView::SyncModel() {
     m.playing = state_ == wvp::PlayerState::Playing;
     m.fullscreen = modes_.fullscreen;
     m.mini = modes_.mini;
-    m.panelOpen = svc_.settings.playlistPanel && !layout_.panelOverlay;
+    m.panelOpen = svc_.settings.playlistPanel && (!layout_.panelOverlay || panelPopup_);   // narrow window: pressed only while the popup is open
     m.panelAvailable = modes_.Mode() == app::ShellMode::NowPlaying;
     m.controlPanelOpen = app::IsFiltersPanelOpen(*this);
     m.timeMode = svc_.settings.timeRemaining ? app::sl::TimeDisplayMode::Remaining : app::sl::TimeDisplayMode::Elapsed;
@@ -568,9 +596,12 @@ bool MainView::SubtitlesShown() {
     });
 }
 
-bool MainView::CanPlaySelection() const {
-    return !Loaded() && shell->Panel()->Visible() && shell->Panel()->CanPlaySelection();
+app::PlaylistPanel* MainView::SelectionPanel() const {
+    app::PlaylistPanel* p = panelPopup_ ? panelPopup_ : (svc_.settings.playlistPanel && !layout_.panelOverlay ? shell->Panel() : nullptr);
+    return p && !p->Stale() && p->CanPlaySelection() ? p : nullptr;
 }
+
+bool MainView::CanPlaySelection() const { return !Loaded() && SelectionPanel(); }
 
 // --- playlists + history (AppPlayback.cpp) ----------------------------------------------------------------------------
 
@@ -595,7 +626,7 @@ void MainView::RestoreCurrentPlaylist() {
     suppressPlaylistPersistence_ = true;
     ctl_->SetQueue(currentPlaylistItems_, -1, false);
     suppressPlaylistPersistence_ = false;
-    shell->Panel()->OnCurrentPlaylistChanged();
+    ForPanels([](app::PlaylistPanel& p) { p.OnCurrentPlaylistChanged(); });
 }
 
 bool MainView::PersistCurrentPlaylist() {
@@ -609,7 +640,7 @@ void MainView::SetCurrentPlaylistName(const std::string& name) {
     currentPlaylist_ = name;
     svc_.settings.currentPlaylist = name;
     svc_.settingsStore.Save(svc_.settings);
-    shell->Panel()->OnCurrentPlaylistChanged();
+    ForPanels([](app::PlaylistPanel& p) { p.OnCurrentPlaylistChanged(); });
 }
 
 void MainView::SavePlaybackSnapshot(const std::string& playlist, const std::string& url, int index, double position, double duration,
@@ -623,7 +654,7 @@ void MainView::SavePlaybackSnapshot(const std::string& playlist, const std::stri
     const bool played = wvp::PlaylistStore::IsPlayedPosition(position, duration, ended);
     svc_.playlists.SavePlaybackStateAsync(playlist, url, position, duration, played, canResume, index);
     historyWriteAt_ = now + 1000;
-    if (played) shell->Panel()->OnItemPlayed(url);
+    if (played) ForPanels([&](app::PlaylistPanel& p) { p.OnItemPlayed(url); });
     if (played) resumeDecision_ = "played: reset to start (near end / EOF)";
 }
 
@@ -717,12 +748,12 @@ void MainView::ReplaceUnnamedPlaylistAtPosition(std::vector<wvp::MediaItem> item
 }
 
 void MainView::PlaylistRenamed(const std::string& from, const std::string& to) {
-    shell->Panel()->OnPlaylistRenamed(from, to);
+    ForPanels([&](app::PlaylistPanel& p) { p.OnPlaylistRenamed(from, to); });
     if (currentPlaylist_ == from) SetCurrentPlaylistName(to);
 }
 
 void MainView::PlaylistDeleted(const std::string& name) {
-    shell->Panel()->OnPlaylistDeleted(name);
+    ForPanels([&](app::PlaylistPanel& p) { p.OnPlaylistDeleted(name); });
     if (currentPlaylist_ != name) return;
     std::vector<wvp::MediaItem> unnamed = PlaylistItems({});
     SetCurrentPlaylistName({});
@@ -733,7 +764,7 @@ void MainView::PlaylistDeleted(const std::string& name) {
     suppressPlaylistPersistence_ = false;
 }
 
-void MainView::PlaylistsChanged() { shell->Panel()->OnPlaylistsChanged(); }
+void MainView::PlaylistsChanged() { ForPanels([](app::PlaylistPanel& p) { p.OnPlaylistsChanged(); }); }
 
 void MainView::CloseMedia() {
     if (!Loaded()) return;
@@ -904,21 +935,74 @@ void MainView::SetVolume(int v) {
     SyncModel();
 }
 
+/// App::TogglePlaylistPanel. Full screen (the right-edge panel) and the mini player keep the toggle disabled.
 void MainView::TogglePlaylistPanel() {
     if (modes_.fullscreen || modes_.mini) return;
-    const bool narrow = layout_.panelOverlay;
+    // Row too narrow to dock the panel (layout_.panelOverlay): the toggle opens / closes it as a light-dismiss popup over the video.
+    // Closing it with the toggle also clears the persisted setting; a light dismiss keeps it (the panel docks once the window is wide enough).
+    const bool nowPlaying = modes_.Mode() == app::ShellMode::NowPlaying;
+    const bool narrow = nowPlaying && layout_.panelOverlay;
+    if (narrow && !panelPopup_) { OpenPanelOverlay(); SyncModel(); return; }
+    if (narrow && panelPopup_) host.ClosePopup(panelPopup_);
+    // The window grows / shrinks by the panel so the video keeps its size (App::ResizeWindowForPlaylistPanel); the narrow
+    // overlay keeps the video-resizing behaviour.
+    const bool resizeWindow = nowPlaying && !narrow && !layout_.video.Empty() && hooks.resizeForPanel;
     const int videoW = layout_.video.w();
     svc_.settings.playlistPanel = !svc_.settings.playlistPanel;
     svc_.settingsStore.Save(svc_.settings);
-    // The window grows / shrinks by the panel so the video keeps its size (App::ResizeWindowForPlaylistPanel).
-    if (!narrow && !layout_.video.Empty() && hooks.resizeForPanel) hooks.resizeForPanel(videoW, svc_.settings.playlistPanel);
-    else ApplyMode();
+    if (resizeWindow) hooks.resizeForPanel(videoW, svc_.settings.playlistPanel);
+    if (nowPlaying) {
+        ApplyMode();
+        if (!narrow && layout_.panelOverlay) OpenPanelOverlay();   // switched on in a window too narrow to dock it
+    } else {
+        SyncModel();
+    }
+}
+
+/// App::FocusPlaylistSearch (Ctrl+S, ⌘F here): opens the panel when hidden and puts the keyboard focus in its search box.
+void MainView::FocusPlaylistSearch() {
+    if (modes_.Mode() != app::ShellMode::NowPlaying) return;
+    if (!svc_.settings.playlistPanel) TogglePlaylistPanel();
+    else if (layout_.panelOverlay && !panelPopup_) OpenPanelOverlay();
+    app::PlaylistPanel* p = panelPopup_ ? panelPopup_ : (shell->Panel()->Visible() ? shell->Panel() : nullptr);
+    if (p) p->FocusSearch();
+}
+
+void MainView::OpenPanelOverlay() {
+    if (panelPopup_ || layout_.video.Empty()) return;
+    const bool fs = modes_.Mode() == app::ShellMode::FullScreen;
+    if (!fs && modes_.Mode() != app::ShellMode::NowPlaying) return;
+    // Narrow window: over the video column. Full screen: the full-height column on the right edge.
+    const float top = layout_.video.t / scale_, bottom = layout_.video.b / scale_, right = layout_.video.r / scale_;
+    const float w = std::max(0.f, std::min((float)svc_.settings.playlistPanelWidthDip, cw_ / scale_ - 16.f));
+    auto panel = std::make_unique<app::PlaylistPanel>(*this, true);
+    app::PlaylistPanel* raw = panel.get();
+    raw->SetBounds({right - w, top, right, bottom});
+    raw->SetSquareCorners(fs);
+    pui::PopupOptions po;
+    po.lightDismiss = true;
+    po.takeFocus = false;
+    if (fs) po.acrylicRadius = 0.f;
+    po.onClosed = [this, raw] {
+        if (panelPopup_ == raw) panelPopup_ = nullptr;
+        SyncModel();
+    };
+    panelPopup_ = raw;
+    host.OpenPopup(std::move(panel), po);
+    raw->Refresh();
+    raw->SetActive(!fs);   // full screen: the hover reveals it; keys stay with the player until the user clicks into it
+    SyncModel();
+}
+
+void MainView::ForPanels(const std::function<void(app::PlaylistPanel&)>& f) {
+    f(*shell->Panel());
+    if (panelPopup_) f(*panelPopup_);
 }
 
 /// App::TogglePause.
 void MainView::TogglePause() {
     if (!Loaded()) {
-        if (CanPlaySelection()) { shell->Panel()->PlaySelection(); return; }
+        if (app::PlaylistPanel* p = SelectionPanel()) { p->PlaySelection(); return; }
     }
     using wvp::PlayerState;
     if (state_ == PlayerState::Ended || state_ == PlayerState::Stopped || state_ == PlayerState::Idle || state_ == PlayerState::Error)
@@ -974,11 +1058,7 @@ void MainView::Execute(CommandId c) {
         break;
     case C::ToggleControlPanel: app::ToggleFiltersPanel(*this); break;
     case C::TogglePlaylistPanel: TogglePlaylistPanel(); break;
-    case C::FocusPlaylistSearch:
-        if (modes_.Mode() != app::ShellMode::NowPlaying) break;
-        if (!svc_.settings.playlistPanel) TogglePlaylistPanel();
-        if (shell->Panel()->Visible()) shell->Panel()->FocusSearch();
-        break;
+    case C::FocusPlaylistSearch: FocusPlaylistSearch(); break;
     case C::CycleAlwaysOnTop: {
         svc_.settings.alwaysOnTop = app::sl::NextAlwaysOnTop(svc_.settings.alwaysOnTop);
         app::OnSettingsChanged(*this);
